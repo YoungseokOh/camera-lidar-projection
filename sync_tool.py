@@ -146,7 +146,7 @@ class ImageSyncTool(QMainWindow):
 
     def _setup_gui(self):
         self.setWindowTitle("이미지 동기화 툴")
-        self.setGeometry(100, 100, 1000, 600) # 창 크기 축소
+        self.setGeometry(100, 100, 1000, 600)
 
         central_widget = QWidget()
         self.setCentralWidget(central_widget)
@@ -157,7 +157,6 @@ class ImageSyncTool(QMainWindow):
         self.a5_filename_label.setAlignment(Qt.AlignCenter)
         self.a5_image_label = QLabel()
         self.a5_image_label.setAlignment(Qt.AlignCenter)
-        # sizePolicy를 Ignored로 설정하여 위젯이 공간을 채우도록 강제
         self.a5_image_label.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Ignored)
         left_layout.addWidget(self.a5_filename_label)
         left_layout.addWidget(self.a5_image_label, 1)
@@ -168,7 +167,6 @@ class ImageSyncTool(QMainWindow):
         self.a6_filename_label.setAlignment(Qt.AlignCenter)
         self.a6_image_label = QLabel()
         self.a6_image_label.setAlignment(Qt.AlignCenter)
-        # sizePolicy를 Ignored로 설정하여 위젯이 공간을 채우도록 강제
         self.a6_image_label.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Ignored)
         right_layout.addWidget(self.a6_filename_label)
         right_layout.addWidget(self.a6_image_label, 1)
@@ -180,6 +178,7 @@ class ImageSyncTool(QMainWindow):
     def _create_shortcuts(self):
         self.shortcuts = {
             'toggle_view': QShortcut(QKeySequence("V"), self, self._toggle_view_mode),
+            'go_home': QShortcut(QKeySequence("H"), self, self._go_to_home_state), # 'H' 키 단축키 추가
             'sync_a5_prev': QShortcut(QKeySequence("Q"), self, self._prev_a5),
             'sync_a5_next': QShortcut(QKeySequence("E"), self, self._next_a5),
             'sync_a6_prev': QShortcut(QKeySequence("A"), self, self._prev_a6),
@@ -239,16 +238,40 @@ class ImageSyncTool(QMainWindow):
             image_label.setText(f"이미지 로드 실패:\n{filename}")
             image_label.setPixmap(QPixmap())
         else:
-            # 라벨의 현재 크기에 맞춰 이미지 크기 조절 (비율 유지)
             scaled_pixmap = pixmap.scaled(image_label.size(), Qt.KeepAspectRatio, Qt.SmoothTransformation)
             image_label.setPixmap(scaled_pixmap)
 
+    # --- 단축키와 연결된 액션 함수들 ---
     def _prev_a5(self): self.a5_index = self.a5_index - 1 if self.a5_index > self.a5_start_index else self.a5_end_index; self._update_display("A5 이전")
     def _next_a5(self): self.a5_index = self.a5_index + 1 if self.a5_index < self.a5_end_index else self.a5_start_index; self._update_display("A5 다음")
     def _prev_a6(self): self.a6_index = self.a6_index - 1 if self.a6_index > self.a6_start_index else self.a6_end_index; self._update_display("A6 이전")
     def _next_a6(self): self.a6_index = self.a6_index + 1 if self.a6_index < self.a6_end_index else self.a6_start_index; self._update_display("A6 다음")
     def _prev_view(self): self.view_index = (self.view_index - 1 + len(self.mapping_data)) % len(self.mapping_data); self._update_display("이전 쌍 보기")
     def _next_view(self): self.view_index = (self.view_index + 1) % len(self.mapping_data); self._update_display("다음 쌍 보기")
+
+    def _go_to_home_state(self):
+        """'H' 키를 눌렀을 때, 마지막 저장 위치 또는 초기 상태로 돌아갑니다."""
+        if self.view_mode:
+            if self.mapping_data:
+                self.view_index = len(self.mapping_data) - 1
+                self._update_display("마지막 저장 쌍으로 이동")
+        else:
+            if self.mapping_data:
+                last_entry = self.mapping_data[-1]
+                a5_filename = os.path.basename(last_entry['a5_original_path'])
+                a6_filename = os.path.basename(last_entry['a6_original_path'])
+                try:
+                    self.a5_index = self.a5_images.index(a5_filename)
+                    self.a6_index = self.a6_images.index(a6_filename)
+                    self._update_display("마지막 저장 위치로 이동")
+                except ValueError:
+                    self.a5_index = self.a5_start_index
+                    self.a6_index = self.a6_start_index
+                    self._update_display("마지막 저장 파일을 찾을 수 없어 초기 상태로 복귀")
+            else:
+                self.a5_index = self.a5_start_index
+                self.a6_index = self.a6_start_index
+                self._update_display("초기 상태로 복귀")
 
     def _toggle_view_mode(self):
         if not self.mapping_data and not self.view_mode:
