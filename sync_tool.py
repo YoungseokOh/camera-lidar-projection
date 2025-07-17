@@ -5,14 +5,17 @@ import shutil
 import re
 from PyQt5.QtWidgets import (QApplication, QMainWindow, QWidget, QLabel, QVBoxLayout, 
                              QHBoxLayout, QMessageBox, QFileDialog,
-                             QTableWidget, QTableWidgetItem, QHeaderView, QShortcut, QSizePolicy)
+                             QTableWidget, QTableWidgetItem, QHeaderView, QShortcut, QSizePolicy, QMenu)
 from PyQt5.QtGui import QPixmap, QKeySequence
-from PyQt5.QtCore import Qt
+from PyQt5.QtCore import Qt, pyqtSignal
 
 class MappingWindow(QWidget):
     """
     매핑 데이터를 테이블 형태로 보여주는 독립적인 창 클래스.
     """
+    row_selected = pyqtSignal(int)
+    delete_requested = pyqtSignal(int)
+
     def __init__(self, parent=None):
         super().__init__(parent)
         self.setWindowTitle("매핑 데이터")
@@ -24,7 +27,33 @@ class MappingWindow(QWidget):
         self.mapping_table.setHorizontalHeaderLabels(["ID", "파일명", "A5 원본", "A6 원본"])
         self.mapping_table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
         self.mapping_table.setEditTriggers(QTableWidget.NoEditTriggers)
+        self.mapping_table.cellClicked.connect(self.on_cell_clicked)
+        self.mapping_table.setContextMenuPolicy(Qt.CustomContextMenu)
+        self.mapping_table.customContextMenuRequested.connect(self.open_menu)
+        self.mapping_table.setStyleSheet('''
+            QTableWidget::item:selected {
+                background-color: #FFFFE0; /* light yellow */
+                color: black;
+            }
+        ''')
         layout.addWidget(self.mapping_table)
+
+    def open_menu(self, position):
+        """컨텍스트 메뉴를 엽니다."""
+        row = self.mapping_table.indexAt(position).row()
+        if row < 0:
+            return
+            
+        menu = QMenu()
+        delete_action = menu.addAction("선택한 쌍 삭제")
+        action = menu.exec_(self.mapping_table.mapToGlobal(position))
+        
+        if action == delete_action:
+            self.delete_requested.emit(row)
+
+    def on_cell_clicked(self, row, column):
+        """테이블 셀 클릭 시 row_selected 신호를 발생시킵니다."""
+        self.row_selected.emit(row)
 
     def update_table(self, data):
         """테이블 내용을 새로운 데이터로 업데이트합니다."""
@@ -75,6 +104,7 @@ class ImageSyncTool(QMainWindow):
     def _setup_paths(self):
         self.a5_dir = os.path.join(self.parent_folder, 'image_a5')
         self.a6_dir = os.path.join(self.parent_folder, 'image_a6')
+        self.pcd_dir = os.path.join(self.parent_folder, 'pcd') # pcd 폴더 경로 추가
         self.synced_data_dir = os.path.join(self.parent_folder, 'synced_data')
         self.synced_a5_dir = os.path.join(self.synced_data_dir, 'image_a5')
         self.synced_a6_dir = os.path.join(self.synced_data_dir, 'image_a6')
@@ -91,6 +121,11 @@ class ImageSyncTool(QMainWindow):
             self.a6_start_frame = int(re.search(r"a6_start\s+(\d+)", content).group(1))
             self.a5_end_frame = int(re.search(r"a5_end\s+(\d+)", content).group(1))
             self.a6_end_frame = int(re.search(r"a6_end\s+(\d+)", content).group(1))
+
+            a5_total = self.a5_end_frame - self.a5_start_frame
+            a6_total = self.a6_end_frame - self.a6_start_frame
+            self.frame_ratio = a5_total / a6_total if a6_total != 0 else 1.0
+            
             return True
         except (AttributeError, ValueError, FileNotFoundError) as e:
             QMessageBox.critical(None, "오류", f"'frame_offset.txt' 파일 분석 중 오류: {e}")
@@ -101,22 +136,34 @@ class ImageSyncTool(QMainWindow):
         return int(match.group(0)) if match else -1
 
     def _load_and_map_images(self):
-        if not os.path.isdir(self.a5_dir) or not os.path.isdir(self.a6_dir):
-            QMessageBox.critical(None, "오류", "이미지 폴더 'image_a5' 또는 'image_a6'를 찾을 수 없습니다.")
+        """pcd 폴더 기준으로 image_a5 목록을 필터링하고, 모든 이미지 목록을 로드 및 매핑합니다."""
+        if not all(os.path.isdir(d) for d in [self.a5_dir, self.a6_dir, self.pcd_dir]):
+            QMessageBox.critical(None, "오류", "필수 폴더('image_a5', 'image_a6', 'pcd') 중 하나를 찾을 수 없습니다.")
             return False
-        self.a5_images = sorted([f for f in os.listdir(self.a5_dir) if f.lower().endswith(('png', 'jpg', 'jpeg', 'bmp', 'gif'))], key=self._parse_frame_number)
+
+        # pcd 파일의 기본 이름 목록 생성
+        pcd_basenames = {os.path.splitext(f)[0] for f in os.listdir(self.pcd_dir)}
+
+        # pcd 목록 기준으로 image_a5 필터링
+        all_a5_images = sorted(os.listdir(self.a5_dir), key=self._parse_frame_number)
+        self.a5_images = [f for f in all_a5_images if os.path.splitext(f)[0] in pcd_basenames]
+        
         self.a6_images = sorted([f for f in os.listdir(self.a6_dir) if f.lower().endswith(('png', 'jpg', 'jpeg', 'bmp', 'gif'))], key=self._parse_frame_number)
+        
         if not self.a5_images or not self.a6_images:
-            QMessageBox.critical(None, "오류", "이미지 폴더가 비어있습니다.")
+            QMessageBox.critical(None, "오류", "이미지 폴더가 비어있거나 pcd와 매칭되는 a5 이미지가 없습니다.")
             return False
+            
         self.a5_frame_to_index = {self._parse_frame_number(f): i for i, f in enumerate(self.a5_images)}
         self.a6_frame_to_index = {self._parse_frame_number(f): i for i, f in enumerate(self.a6_images)}
+        
         self.a5_start_index = self.a5_frame_to_index.get(self.a5_start_frame)
         self.a5_end_index = self.a5_frame_to_index.get(self.a5_end_frame)
         self.a6_start_index = self.a6_frame_to_index.get(self.a6_start_frame)
         self.a6_end_index = self.a6_frame_to_index.get(self.a6_end_frame)
+        
         if any(i is None for i in [self.a5_start_index, self.a5_end_index, self.a6_start_index, self.a6_end_index]):
-            QMessageBox.critical(None, "오류", "'frame_offset.txt'에 지정된 프레임 번호에 해당하는 이미지를 찾을 수 없습니다.")
+            QMessageBox.critical(None, "오류", "'frame_offset.txt'에 지정된 프레임 번호에 해당하는 이미지를 (필터링 된 목록에서) 찾을 수 없습니다.")
             return False
         return True
 
@@ -173,12 +220,28 @@ class ImageSyncTool(QMainWindow):
         image_layout.addLayout(right_layout, 1)
         
         self.mapping_window = MappingWindow()
+        self.mapping_window.row_selected.connect(self.on_mapping_table_row_selected)
+        self.mapping_window.delete_requested.connect(self._request_delete_pair)
         self.statusBar().showMessage("준비 완료")
+
+    def on_mapping_table_row_selected(self, row_index):
+        """매핑 테이블에서 행이 선택되었을 때 호출되는 슬롯."""
+        if not self.mapping_data or not (0 <= row_index < len(self.mapping_data)):
+            return
+
+        # 보기 모드가 아니면 보기 모드로 전환
+        if not self.view_mode:
+            self.view_mode = True
+            self._update_shortcut_states()
+
+        self.view_index = row_index
+        item_id = self.mapping_data[row_index].get('id', 'N/A')
+        self._update_display(f"ID {item_id}번 쌍으로 이동")
 
     def _create_shortcuts(self):
         self.shortcuts = {
             'toggle_view': QShortcut(QKeySequence("V"), self, self._toggle_view_mode),
-            'go_home': QShortcut(QKeySequence("H"), self, self._go_to_home_state), # 'H' 키 단축키 추가
+            'go_home': QShortcut(QKeySequence("H"), self, self._go_to_home_state),
             'sync_a5_prev': QShortcut(QKeySequence("Q"), self, self._prev_a5),
             'sync_a5_next': QShortcut(QKeySequence("E"), self, self._next_a5),
             'sync_a6_prev': QShortcut(QKeySequence("A"), self, self._prev_a6),
@@ -207,9 +270,21 @@ class ImageSyncTool(QMainWindow):
         if self.view_mode:
             if not self.mapping_data:
                 self.statusBar().showMessage("표시할 저장된 데이터가 없습니다. (V 키로 동기화 모드로 전환)")
+                self.mapping_window.mapping_table.clearSelection()
                 return
+            
+            # view_index가 유효한지 확인 및 조정
+            if self.view_index >= len(self.mapping_data):
+                self.view_index = len(self.mapping_data) - 1
+            if self.view_index < 0:
+                self.view_index = 0
+
             entry = self.mapping_data[self.view_index]
             filename = entry['new_filename']
+
+            # 매핑 테이블의 해당 행을 선택하여 하이라이트
+            self.mapping_window.mapping_table.selectRow(self.view_index)
+
             self._update_panel(self.synced_a5_dir, [item['new_filename'] for item in self.mapping_data], self.view_index, self.a5_image_label, self.a5_filename_label)
             self._update_panel(self.synced_a6_dir, [item['new_filename'] for item in self.mapping_data], self.view_index, self.a6_image_label, self.a6_filename_label)
             status_text = f"보기 모드: {self.view_index + 1}/{len(self.mapping_data)} ({filename})"
@@ -218,7 +293,7 @@ class ImageSyncTool(QMainWindow):
             self._update_panel(self.a6_dir, self.a6_images, self.a6_index, self.a6_image_label, self.a6_filename_label)
             a5_frame = self._parse_frame_number(self.a5_images[self.a5_index])
             a6_frame = self._parse_frame_number(self.a6_images[self.a6_index])
-            status_text = f"저장된 쌍: {len(self.mapping_data)} | A5: {a5_frame} | A6: {a6_frame}"
+            status_text = f"저장된 쌍: {len(self.mapping_data)} | A5: {self.a5_index + 1}/{len(self.a5_images)} ({a5_frame}) | A6: {self.a6_index + 1}/{len(self.a6_images)} ({a6_frame})"
 
         if status_message: self.last_status_message = status_message
         if self.last_status_message: status_text += f" | {self.last_status_message}"
@@ -241,16 +316,62 @@ class ImageSyncTool(QMainWindow):
             scaled_pixmap = pixmap.scaled(image_label.size(), Qt.KeepAspectRatio, Qt.SmoothTransformation)
             image_label.setPixmap(scaled_pixmap)
 
-    # --- 단축키와 연결된 액션 함수들 ---
-    def _prev_a5(self): self.a5_index = self.a5_index - 1 if self.a5_index > self.a5_start_index else self.a5_end_index; self._update_display("A5 이전")
-    def _next_a5(self): self.a5_index = self.a5_index + 1 if self.a5_index < self.a5_end_index else self.a5_start_index; self._update_display("A5 다음")
-    def _prev_a6(self): self.a6_index = self.a6_index - 1 if self.a6_index > self.a6_start_index else self.a6_end_index; self._update_display("A6 이전")
-    def _next_a6(self): self.a6_index = self.a6_index + 1 if self.a6_index < self.a6_end_index else self.a6_start_index; self._update_display("A6 다음")
-    def _prev_view(self): self.view_index = (self.view_index - 1 + len(self.mapping_data)) % len(self.mapping_data); self._update_display("이전 쌍 보기")
-    def _next_view(self): self.view_index = (self.view_index + 1) % len(self.mapping_data); self._update_display("다음 쌍 보기")
+    def _update_a5_based_on_a6(self):
+        """현재 A6 프레임에 따라 A5 프레임을 자동으로 계산하고 업데이트합니다."""
+        current_a6_frame = self._parse_frame_number(self.a6_images[self.a6_index])
+        
+        rel_idx = current_a6_frame - self.a6_start_frame
+        target_a5_frame = self.a5_start_frame + int(rel_idx * self.frame_ratio)
+
+        # 계산된 프레임 번호와 가장 가까운 실제 A5 이미지를 찾습니다.
+        closest_a5_image = min(self.a5_images, key=lambda img: abs(self._parse_frame_number(img) - target_a5_frame))
+        
+        try:
+            # 찾은 이미지의 인덱스로 a5_index를 업데이트합니다.
+            self.a5_index = self.a5_images.index(closest_a5_image)
+        except ValueError:
+            # 만약 이미지를 찾지 못하면(이론상 발생하지 않아야 함), 시작 인덱스로 되돌립니다.
+            self.a5_index = self.a5_start_index
+
+    def _navigate_index(self, current_index_attr, start_index_attr, end_index_attr, step, message, update_a5=False):
+        current_index = getattr(self, current_index_attr)
+        start_index = getattr(self, start_index_attr)
+        end_index = getattr(self, end_index_attr)
+
+        if step == -1: # Previous
+            new_index = current_index - 1 if current_index > start_index else end_index
+        else: # Next
+            new_index = current_index + 1 if current_index < end_index else start_index
+        
+        setattr(self, current_index_attr, new_index)
+        
+        if update_a5:
+            self._update_a5_based_on_a6()
+        self._update_display(message)
+
+    def _navigate_circular_index(self, current_index_attr, data_list_attr, step, message):
+        current_index = getattr(self, current_index_attr)
+        data_list = getattr(self, data_list_attr)
+        
+        if not data_list: # Handle empty list case for view mode
+            self._update_display("표시할 저장된 데이터가 없습니다.")
+            return
+
+        new_index = (current_index + step + len(data_list)) % len(data_list)
+        setattr(self, current_index_attr, new_index)
+        self._update_display(message)
+
+    def _prev_a5(self): self._navigate_index('a5_index', 'a5_start_index', 'a5_end_index', -1, "A5 이전")
+    def _next_a5(self): self._navigate_index('a5_index', 'a5_start_index', 'a5_end_index', 1, "A5 다음")
+
+    def _prev_a6(self): self._navigate_index('a6_index', 'a6_start_index', 'a6_end_index', -1, "A6 이전", update_a5=True)
+
+    def _next_a6(self): self._navigate_index('a6_index', 'a6_start_index', 'a6_end_index', 1, "A6 다음", update_a5=True)
+
+    def _prev_view(self): self._navigate_circular_index('view_index', 'mapping_data', -1, "이전 쌍 보기")
+    def _next_view(self): self._navigate_circular_index('view_index', 'mapping_data', 1, "다음 쌍 보기")
 
     def _go_to_home_state(self):
-        """'H' 키를 눌렀을 때, 마지막 저장 위치 또는 초기 상태로 돌아갑니다."""
         if self.view_mode:
             if self.mapping_data:
                 self.view_index = len(self.mapping_data) - 1
@@ -291,9 +412,8 @@ class ImageSyncTool(QMainWindow):
             QMessageBox.warning(self, "중복 저장", "선택된 이미지 중 하나 이상이 이미 다른 쌍에 포함되어 있습니다.")
             return
 
-        if not os.path.exists(self.synced_data_dir):
-            os.makedirs(self.synced_a5_dir)
-            os.makedirs(self.synced_a6_dir)
+        os.makedirs(self.synced_a5_dir, exist_ok=True)
+        os.makedirs(self.synced_a6_dir, exist_ok=True)
 
         new_filename = f"{self.sync_counter:010d}.png"
         dest_a5_path = os.path.join(self.synced_a5_dir, new_filename)
@@ -313,6 +433,9 @@ class ImageSyncTool(QMainWindow):
         self.mapping_data.append(mapping_entry)
         self.synced_original_paths.add(abs_src_a5)
         self.synced_original_paths.add(abs_src_a6)
+        
+        # ID 정렬 후 저장
+        self.mapping_data.sort(key=lambda x: x['id'])
         self._save_mapping_data()
         self.mapping_window.update_table(self.mapping_data)
 
@@ -320,30 +443,66 @@ class ImageSyncTool(QMainWindow):
         self._update_display(f"성공: ID {self.sync_counter-1}번 쌍 저장!")
 
     def _delete_last_pair(self):
+        """가장 마지막에 저장된 쌍을 삭제합니다."""
         if not self.mapping_data:
             QMessageBox.information(self, "정보", "삭제할 저장된 쌍이 없습니다.")
             return
-        if QMessageBox.question(self, "확인", "가장 마지막 쌍을 삭제하시겠습니까?", QMessageBox.Yes | QMessageBox.No, QMessageBox.No) == QMessageBox.No:
-            return
-
-        last_entry = self.mapping_data.pop()
-        self.synced_original_paths.remove(last_entry['a5_original_path'])
-        self.synced_original_paths.remove(last_entry['a6_original_path'])
         
-        file_to_delete = os.path.join(self.synced_a5_dir, last_entry['new_filename'])
-        if os.path.exists(file_to_delete): os.remove(file_to_delete)
-        file_to_delete = os.path.join(self.synced_a6_dir, last_entry['new_filename'])
-        if os.path.exists(file_to_delete): os.remove(file_to_delete)
+        # ID를 기준으로 마지막 항목을 찾습니다.
+        last_entry = max(self.mapping_data, key=lambda x: x['id'])
+        index_to_delete = self.mapping_data.index(last_entry)
+        
+        reply = QMessageBox.question(self, "삭제 확인", "가장 마지막 쌍을 삭제하시겠습니까?", 
+                                     QMessageBox.Yes | QMessageBox.No, QMessageBox.No)
+        if reply == QMessageBox.Yes:
+            self._perform_delete(index_to_delete, last_entry)
 
-        self.sync_counter = last_entry['id']
+    def _request_delete_pair(self, index):
+        """매핑 테이블에서 요청된 특정 쌍의 삭제를 처리합니다."""
+        if not (0 <= index < len(self.mapping_data)):
+            return
+            
+        entry_to_delete = self.mapping_data[index]
+        entry_id = entry_to_delete.get('id', 'N/A')
+
+        reply = QMessageBox.question(self, "삭제 확인", f"ID {entry_id}번 쌍을 삭제하시겠습니까?",
+                                     QMessageBox.Yes | QMessageBox.No, QMessageBox.No)
+        if reply == QMessageBox.Yes:
+            self._perform_delete(index, entry_to_delete)
+
+    def _perform_delete(self, index, entry_to_delete):
+        """실제 파일 및 데이터 삭제를 수행하는 공통 메소드."""
+        # 데이터 목록에서 항목 제거
+        del self.mapping_data[index]
+
+        # 원본 경로 집합에서 제거
+        if entry_to_delete['a5_original_path'] in self.synced_original_paths:
+            self.synced_original_paths.remove(entry_to_delete['a5_original_path'])
+        if entry_to_delete['a6_original_path'] in self.synced_original_paths:
+            self.synced_original_paths.remove(entry_to_delete['a6_original_path'])
+        
+        # 실제 파일 삭제
+        for dir_path in [self.synced_a5_dir, self.synced_a6_dir]:
+            file_to_delete = os.path.join(dir_path, entry_to_delete['new_filename'])
+            if os.path.exists(file_to_delete):
+                os.remove(file_to_delete)
+
+        # 다음 저장 ID를 가장 높은 ID + 1로 재설정 (더 안전한 방식)
+        if self.mapping_data:
+            self.sync_counter = max(item.get('id', -1) for item in self.mapping_data) + 1
+        else:
+            self.sync_counter = 0
+
         self._save_mapping_data()
         self.mapping_window.update_table(self.mapping_data)
         
-        status_message = f"성공: ID {last_entry['id']}번 쌍 삭제 완료!"
+        status_message = f"성공: ID {entry_to_delete['id']}번 쌍 삭제 완료!"
+        
         if self.view_mode and not self.mapping_data:
             self.view_mode = False
             self._update_shortcut_states()
             status_message += " 동기화 모드로 전환합니다."
+        
         self._update_display(status_message)
 
     def _save_mapping_data(self):
@@ -358,7 +517,9 @@ def main():
     if len(sys.argv) > 1:
         parent_folder = sys.argv[1]
     else:
-        parent_folder = QFileDialog.getExistingDirectory(None, "동기화할 이미지들의 상위 폴더를 선택하세요", ".")
+        default_path = r"Y:\adasip\Temp\20250711_LC_test\20250711_A6_A5_LC_test\ncdb_a6_dataset\2025_07_11"
+        start_path = default_path if os.path.isdir(default_path) else "."
+        parent_folder = QFileDialog.getExistingDirectory(None, "동기화할 이미지들의 상위 폴더를 선택하세요", start_path)
         if not parent_folder:
             sys.exit("폴더가 선택되지 않았습니다.")
 

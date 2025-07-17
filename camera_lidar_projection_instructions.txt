@@ -1,0 +1,221 @@
+You are to write a **pure Python** module (no C++ build) that projects LiDAR point clouds onto synchronized camera images for quick visual QA of calibration.
+
+## 1. Scope
+- Input: `parent_folder` path containing subfolders: `image_a5/`, `image_a6/`, `pcd/`, `synced_data/` (inside: `mapping_data.json`, plus synced image copies but we mainly use original paths in JSON).
+- For each record in `mapping_data.json`, load:
+  - `a5_original_path` (absolute path to original A5 image)
+  - `a6_original_path` (absolute path to original A6 image)
+  - Use basename of **A5 image** (without extension) to locate matching PCD file: `parent_folder/pcd/<basename>.pcd`.
+    *Assumption:* A5 image filenames are aligned with LiDAR frame indices.
+- Project that PCD onto the requested camera image(s): A5, A6, or both.
+- Overlay colored points by distance and save result images.
+
+## 2. Dependencies (Python only)
+Use **numpy**, **Pillow** (PIL) for image I/O & drawing, and **open3d** for reading `.pcd` files (fallback: simple ASCII PCD parser if open3d missing). Do *not* depend on PyQt; integration hook is provided as a function return type (image as PIL Image or numpy array). :contentReference[oaicite:1]{index=1}
+
+## 3. Camera Models to Support
+Implement a small hierarchy:
+
+```python
+class CameraModelBase:
+    def project_point(self, Xc, Yc, Zc): ...
+```
+
+Return integer pixel `(u,v)` and boolean `valid`.
+
+### 3.1 Pinhole (fx, fy, cx, cy)
+Standard perspective projection from camera coordinates (Xc,Yc,Zc>0):
+```
+xn = Xc / Zc
+yn = Yc / Zc
+u = fx * xn + cx
+v = fy * yn + cy
+```
+Ignore radial/tangential distortion for this test module. :contentReference[oaicite:2]{index=2}
+
+### 3.2 EUCM (Extended Unified Camera Model)
+Parameters: `[fx, fy, cx, cy, alpha, beta]` with `alpha∈[0,1], beta>0`.
+
+```
+d = sqrt(beta * (Xc*Xc + Yc*Yc) + Zc*Zc)
+den = alpha * d + (1 - alpha) * Zc
+u = fx * (Xc / den) + cx
+v = fy * (Yc / den) + cy
+```
+If `alpha=0, beta=1`, reduces toward pinhole behavior (den≈Zc). :contentReference[oaicite:3]{index=3}
+
+### 3.3 VADAS Polynomial Fisheye (custom; Scaramuzza‑style radial poly)
+We receive an 18‑element intrinsic vector. Use the first 7 as polynomial coefficients k0..k6; index 7 = scale factor `s`; index 8 = divisor/normalizer `div`; index 9 = x offset `ux`; index 10 = y offset `uy`; remaining indices [11:] keep but unused for now.
+
+Procedure given camera coords (Xc,Yc,Zc):
+```
+# project onto plane orthogonal to X axis (camera forward)
+nx = -Yc
+ny = -Zc
+dist = hypot(nx, ny); eps guard
+cosPhi = nx / dist
+sinPhi = ny / dist
+theta = atan2(dist, Xc)   # angle from optical axis
+xd = theta * s            # scaled angle
+rd = poly_eval(k0..k6, xd) / div
+u = rd * cosPhi + ux + (img_w / 2)
+v = rd * sinPhi + uy + (img_h / 2)
+```
+This mirrors a polynomial fisheye mapping where radial displacement is a polynomial in the incidence angle, similar in spirit to Scaramuzza’s OCamCalib omnidirectional formulation; we simply use the provided coefficient ordering. :contentReference[oaicite:4]{index=4}
+
+> NOTE: If `dist==0`, set `cosPhi=1, sinPhi=0` and `theta=0`.
+> You may optionally clamp or reject points beyond FOV if `rd` becomes NaN/inf.
+
+## 4. Calibration Input
+Provide a simple way to inject calibration per camera:
+
+```python
+CALIB = {
+  "a5": {
+    "model": "vadas",  # or "pinhole" / "eucm"
+    "intrinsic": [-0.0004, 1.0136, -0.0623, 0.2852, -0.332, 0.1896, -0.0391,
+                  1.0447, 0.0021, 44.9516, 2.48822, 0, 0.9965, -0.0067,
+                  -0.0956, 0.1006, -0.054, 0.0106],
+    # rodriguesExtrinsic: 6 params [rx, ry, rz, tx, ty, tz] OR 4x4 matrix
+    "extrinsic": [0.0900425, -0.00450864, -0.356367, 0.00100918, -0.236104, -0.0219886],
+    "image_size": null  # auto-read from image
+  },
+  "a6": { ... }
+}
+```
+
+If `extrinsic` is 6‑vec Rodrigues+T, convert using OpenCV Rodrigues math (you may re‑implement tiny Rodrigues exp to avoid cv2 dep: approximate closed-form using skew matrix). Intrinsic matrix meaning (fx,fy,cx,cy) per standard camera matrix K reference. :contentReference[oaicite:5]{index=5}
+
+## 5. LiDAR→World (optional) and Frame Chain
+Allow optional `lidar_to_world` 4×4. Effective transform:
+`L2C = CamExtrinsic * L2W` if L2W provided else just CamExtrinsic (assumed LiDAR→Cam directly).
+Document clearly in code; mismatched order is a common error in multi‑sensor fusion. :contentReference[oaicite:6]{index=6}
+
+## 6. Projection Filtering & Coloring
+- Reject points with `Xc <= 0` (behind camera) OR outside user `max_range_m` (CLI arg; default 100.0).
+- After projection, include pixel bounds check: `0 <= u < W`, `0 <= v < H`.
+- Color code by forward distance or Euclidean range; map 0..max_range to a simple gradient (e.g., blue→red or colormap via HSV). Draw 1‑pixel dot (or small square) on the image using Pillow `ImageDraw.point()` or `ImageDraw.ellipse()`. :contentReference[oaicite:7]{index=7}
+
+## 7. Data Loading Utilities
+### 7.1 mapping_data.json
+Read JSON list of dicts. Each record has: `id`, `new_filename`, `a5_original_path`, `a6_original_path`.
+### 7.2 PCD loader
+Try `open3d.io.read_point_cloud(path)` → numpy array using `np.asarray(pcd.points)`. If open3d unavailable, implement minimal ASCII PCD parse (read header, POINTS, then load xyz). :contentReference[oaicite:8]{index=8}
+
+## 8. Public API (what I will import)
+Create a lightweight package structure (single file ok; multi‑file optional):
+
+```python
+class SensorInfo:
+    def __init__(self, name, model, intrinsic, extrinsic, image_size=None): ...
+
+class CalibrationDB:
+    def __init__(self, calib_dict, lidar_to_world=None):
+        # build 4x4 extrinsic per sensor
+    def get(self, name) -> SensorInfo: ...
+
+class LidarCameraProjector:
+    def __init__(self, calib_db, max_range_m=100.0, axis="default"):
+        ...
+    def project_cloud_to_image(self, sensor_name, cloud_xyz: np.ndarray, pil_image):
+        """
+        cloud_xyz: (N,3) in LiDAR frame
+        returns new PIL image with overlaid points
+        """
+        ...
+
+def load_pcd_xyz(path) -> np.ndarray: ...
+def load_image(path) -> PIL.Image.Image: ...
+```
+
+## 9. Batch Runner
+Provide:
+
+```python
+def project_from_mapping(parent_folder, projector, cams=("a5","a6"),
+                         output_dir=None, exist_ok=True, limit=None, verbose=True):
+    """
+    Iterate mapping_data.json. For each record:
+      - find PCD via A5 basename
+      - project to requested cams
+      - save overlay to output_dir/<cam>/<id>.png
+    Return list of result dicts: {id, cam, in_pts, on_image_pts, ratio, out_path}
+    """
+```
+
+## 10. PyQt Integration Hook
+Add a helper that returns NumPy (H,W,3) or QImage‑compatible bytes so an external GUI (ImageSyncTool) can display without saving:
+
+```python
+def project_pair_to_ndarray(projector, cam, a5_path, a6_path, pcd_path):
+    # choose correct img path by cam
+    # return np.uint8 array (RGB)
+```
+
+## 11. Example Usage (script)
+Provide a `main()` with argparse:
+
+```
+python -m camera_lidar_proj \
+  --parent PARENT \
+  --cam a5,a6 \
+  --max_range 50 \
+  --save_dir PARENT/projection_out \
+  --calib_json calib.json \
+  [--lidar_to_world l2w.txt]
+```
+
+If `--calib_json` absent, embed example CALIB dict (see §4). If `l2w.txt` absent, identity. Print summary counts.
+
+## 12. Validation / Sanity Checks
+- Warn if PCD missing for a record (skip).
+- Assert intrinsics length matches selected model.
+- Count projected points (in front of camera) and drawn points (inside image) per frame; include ratio in log.
+- Optional quick test: synthetic 3D point (0,0,5) should land near principal point for pinhole α=0. :contentReference[oaicite:9]{index=9}
+
+## 13. Code Quality
+- Type hints, docstrings.
+- No global state; everything testable.
+- Functions small & unit‑test friendly.
+- Windows & POSIX path safe (use pathlib).
+- Accept both forward/backslash in JSON paths; normalize.
+
+## 14. Deliverables
+Produce a single importable file `camera_lidar_projector.py` **plus** optional `__main__.py` CLI. Write minimal README in module docstring with usage steps.
+
+---
+
+### Provided Sample Matrices
+
+**Example LiDAR→World 4×4** (replace with real; identity ok):
+
+```
+[[-0.998752, -0.00237052, -0.0498847,  0.0375091],
+ [ 0.00167658, -0.999901,   0.0139481,  0.0349093],
+ [-0.0499128,  0.0138471,   0.998658,   0.771878],
+ [ 0.,         0.,          0.,         1.       ]]
+```
+
+**Example A5 extrinsic Rodrigues+T**:
+`[0.0900425, -0.00450864, -0.356367, 0.00100918, -0.236104, -0.0219886]`
+
+**Example A5 intrinsic (VADAS)**:
+`[-0.0004, 1.0136, -0.0623, 0.2852, -0.332, 0.1896, -0.0391, 1.0447, 0.0021, 44.9516, 2.48822, 0, 0.9965, -0.0067, -0.0956, 0.1006, -0.054, 0.0106]`
+
+---
+
+### Output Expectations
+Running on a folder should create:
+
+```
+projection_out/
+ ├─ a5/0000000000.png
+ ├─ a5/0000000001.png
+ ├─ a6/0000000000.png
+ ...
+ └─ summary.json  # optional stats
+```
+
+---
+
+**Generate the full Python implementation now.**

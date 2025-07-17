@@ -98,7 +98,7 @@ JSON
   },
   {
     "id": 1,
-    "new_filename": "000001.png",
+    "new_filename": "0000000001.png",
     "a5_original_path": "Y:\\...\\image_a5\\original_name_2.png",
     "a6_original_path": "Y:\\...\\image_a6\\original_name_B.png"
   }
