@@ -5,6 +5,7 @@ import shutil
 import re
 import math
 import traceback
+from collections import OrderedDict
 from typing import Dict, List, Tuple, Optional, Any
 
 import numpy as np
@@ -406,6 +407,11 @@ class ImageSyncTool(QMainWindow):
         self.last_status_message, self.view_mode, self.view_index = "", False, 0
         self.synced_original_paths = set()
         self.projector, self.projection_enabled = None, False
+        
+        # --- Caching Initialization ---
+        self.projection_cache = OrderedDict()
+        self.MAX_CACHE_SIZE = 50  # Store up to 50 projected images
+        
         self._initialize_projector()
 
     def _initialize_projector(self):
@@ -536,35 +542,55 @@ class ImageSyncTool(QMainWindow):
         image_path = os.path.join(img_dir, filename)
         
         is_a6_panel = (image_label is self.a6_image_label)
+        is_projected = is_a6_panel and self.projection_enabled
+        pixmap = None
+
+        # --- Caching Logic ---
+        if is_projected and self.projector:
+            pcd_path = self._find_pcd_path(pcd_ref_path)
+            if pcd_path:
+                cache_key = (image_path, pcd_path)
+                if cache_key in self.projection_cache:
+                    pixmap = self.projection_cache[cache_key]
+                    self.projection_cache.move_to_end(cache_key) # Mark as recently used
         
-        try:
-            pil_image = Image.open(image_path).convert("RGB")
+        if pixmap is None: # If not in cache or not a projection case
+            try:
+                pil_image = Image.open(image_path).convert("RGB")
 
-            if is_a6_panel and self.projection_enabled and self.projector:
-                pcd_path = self._find_pcd_path(pcd_ref_path)
-                if pcd_path:
-                    try:
-                        cloud_xyz = self.projector._load_pcd_xyz(pcd_path)
-                        if cloud_xyz.size > 0:
-                            projected_pil, _, _ = self.projector.project_cloud_to_image('a6', cloud_xyz, pil_image)
-                            pil_image = projected_pil
-                        else:
-                            print(f"Warning: PCD file is empty: {pcd_path}", file=sys.stderr)
-                    except Exception as e:
-                        print(f"Error during projection: {e}", file=sys.stderr)
-                        traceback.print_exc()
-                elif pcd_ref_path:
-                    print(f"Warning: Could not find corresponding PCD for A5 image: {os.path.basename(pcd_ref_path)}", file=sys.stderr)
+                if is_projected and self.projector:
+                    pcd_path = self._find_pcd_path(pcd_ref_path) # Re-finding, but it's cheap
+                    if pcd_path:
+                        try:
+                            cloud_xyz = self.projector._load_pcd_xyz(pcd_path)
+                            if cloud_xyz.size > 0:
+                                projected_pil, _, _ = self.projector.project_cloud_to_image('a6', cloud_xyz, pil_image)
+                                pil_image = projected_pil
+                            else:
+                                print(f"Warning: PCD file is empty: {pcd_path}", file=sys.stderr)
+                        except Exception as e:
+                            print(f"Error during projection: {e}", file=sys.stderr)
+                            traceback.print_exc()
+                    elif pcd_ref_path:
+                        print(f"Warning: Could not find corresponding PCD for A5 image: {os.path.basename(pcd_ref_path)}", file=sys.stderr)
 
-            np_image = np.array(pil_image)
-            height, width, channel = np_image.shape
-            bytes_per_line = 3 * width
-            qimage = QImage(np_image.data, width, height, bytes_per_line, QImage.Format_RGB888)
-            pixmap = QPixmap.fromImage(qimage)
-        except Exception as e:
-            image_label.setText(f"Image load failed:\n{filename}\nError: {e}")
-            image_label.setPixmap(QPixmap())
-            return
+                np_image = np.array(pil_image)
+                height, width, channel = np_image.shape
+                bytes_per_line = 3 * width
+                qimage = QImage(np_image.data, width, height, bytes_per_line, QImage.Format_RGB888)
+                pixmap = QPixmap.fromImage(qimage)
+
+                # --- Store in Cache ---
+                if is_projected and self.projector and pcd_path:
+                    cache_key = (image_path, pcd_path)
+                    self.projection_cache[cache_key] = pixmap
+                    if len(self.projection_cache) > self.MAX_CACHE_SIZE:
+                        self.projection_cache.popitem(last=False) # Remove least recently used
+
+            except Exception as e:
+                image_label.setText(f"Image load failed:\n{filename}\nError: {e}")
+                image_label.setPixmap(QPixmap())
+                return
 
         # Determine border style based on state
         norm_image_path = os.path.normcase(os.path.abspath(image_path))
@@ -572,8 +598,6 @@ class ImageSyncTool(QMainWindow):
         
         if self.view_mode:
             is_synced = True
-
-        is_projected = is_a6_panel and self.projection_enabled
 
         # Base style with padding
         base_style = "padding: 3px;"
