@@ -140,7 +140,7 @@ class CalibrationDB:
 
 class LidarProjector:
     """Projects LiDAR point clouds onto camera images, based on C++ reference."""
-    def __init__(self, calib_db: CalibrationDB, max_range_m: float = 100.0, point_radius: int = 2):
+    def __init__(self, calib_db: CalibrationDB, max_range_m: float = 10.0, point_radius: int = 2):
         self.calib_db = calib_db
         self.max_range_m = max_range_m
         self.point_radius = point_radius
@@ -169,12 +169,31 @@ class LidarProjector:
         return np.array(points, dtype=np.float64)
 
     def _get_color_from_distance(self, distance: float) -> Tuple[int, int, int]:
+        """
+        Calculates a color based on distance using a JET-like colormap.
+        The colormap transitions from deep blue for close objects to dark red for distant objects,
+        providing a smooth and perceptually uniform gradient.
+        """
         normalized_dist = max(0.0, min(1.0, distance / self.max_range_m))
-        if normalized_dist < 0.5:
-            r, g, b = 0, int(255 * (normalized_dist * 2)), int(255 * (1 - normalized_dist * 2))
-        else:
-            r, g, b = int(255 * ((normalized_dist - 0.5) * 2)), int(255 * (1 - (normalized_dist - 0.5) * 2)), 0
-        return (r, g, b)
+
+        # This is a common, simplified implementation of the JET colormap.
+        # It maps the [0, 1] range to a blue-cyan-yellow-red-dark red spectrum.
+        # The logic is based on piecewise linear functions for R, G, B channels.
+        v = normalized_dist
+        
+        # The colormap is calculated by defining linear ramps for R, G, and B
+        # that are active over different parts of the value range.
+        four_v = 4.0 * v
+        r = min(four_v - 1.5, -four_v + 4.5)
+        g = min(four_v - 0.5, -four_v + 3.5)
+        b = min(four_v + 0.5, -four_v + 2.5)
+
+        # Clamp values to [0, 1] range and scale to 0-255
+        r_byte = int(max(0.0, min(1.0, r)) * 255)
+        g_byte = int(max(0.0, min(1.0, g)) * 255)
+        b_byte = int(max(0.0, min(1.0, b)) * 255)
+
+        return (r_byte, g_byte, b_byte)
 
     def project_cloud_to_image(self, sensor_name: str, cloud_xyz: np.ndarray, pil_image: Image.Image) -> Tuple[Image.Image, int, int]:
         sensor_info = self.calib_db.get(sensor_name)
@@ -193,7 +212,8 @@ class LidarProjector:
         on_image_count = 0
         for i in range(points_cam.shape[0]):
             Xc, Yc, Zc = points_cam[i]
-            if Xc <= 0 or Xc >= 4.3 or Zc >= 3:
+            # Filter points behind the camera, but remove other distance/height restrictions
+            if Xc <= 0:
                 continue
             in_front_of_camera_count += 1
             u, v, valid_projection = camera_model.project_point(Xc, Yc, Zc)
@@ -456,14 +476,20 @@ class ImageSyncTool(QMainWindow):
             'view_prev': QShortcut(QKeySequence("A"), self, lambda: self._navigate_circular_index('view_index', 'mapping_data', -1, "Previous Pair")),
             'view_next': QShortcut(QKeySequence("D"), self, lambda: self._navigate_circular_index('view_index', 'mapping_data', 1, "Next Pair")),
             'toggle_projection': QShortcut(QKeySequence("P"), self, self._toggle_projection),
+            'save_projection': QShortcut(QKeySequence("Ctrl+S"), self, self._save_full_res_projection),
         }
         self._update_shortcut_states()
 
     def _update_shortcut_states(self):
         is_sync_mode = not self.view_mode
         for key, sc in self.shortcuts.items():
-            if key.startswith('sync_'): sc.setEnabled(is_sync_mode)
-            elif key.startswith('view_'): sc.setEnabled(self.view_mode)
+            if key.startswith('sync_'):
+                sc.setEnabled(is_sync_mode)
+            elif key.startswith('view_'):
+                sc.setEnabled(self.view_mode)
+            elif key == 'save_projection':
+                # Enable save projection only when projection is on
+                sc.setEnabled(self.projection_enabled)
 
     def _update_display(self, status_message=None):
         if self.view_mode:
@@ -515,21 +541,19 @@ class ImageSyncTool(QMainWindow):
             pil_image = Image.open(image_path).convert("RGB")
 
             if is_a6_panel and self.projection_enabled and self.projector:
-                # In view mode, the pcd_ref_path is the a5_original_path from mapping data.
-                # In sync mode, it's the current a5_path.
                 pcd_path = self._find_pcd_path(pcd_ref_path)
                 if pcd_path:
                     try:
                         cloud_xyz = self.projector._load_pcd_xyz(pcd_path)
                         if cloud_xyz.size > 0:
                             projected_pil, _, _ = self.projector.project_cloud_to_image('a6', cloud_xyz, pil_image)
-                            pil_image = projected_pil  # Use the projected image
+                            pil_image = projected_pil
                         else:
                             print(f"Warning: PCD file is empty: {pcd_path}", file=sys.stderr)
                     except Exception as e:
                         print(f"Error during projection: {e}", file=sys.stderr)
                         traceback.print_exc()
-                elif pcd_ref_path: # Only warn if a reference path was actually provided
+                elif pcd_ref_path:
                     print(f"Warning: Could not find corresponding PCD for A5 image: {os.path.basename(pcd_ref_path)}", file=sys.stderr)
 
             np_image = np.array(pil_image)
@@ -540,22 +564,41 @@ class ImageSyncTool(QMainWindow):
         except Exception as e:
             image_label.setText(f"Image load failed:\n{filename}\nError: {e}")
             image_label.setPixmap(QPixmap())
-            pixmap = QPixmap() # Ensure pixmap is always defined
             return
-        
-        border_color = "transparent"
-        # In view mode, all displayed images are part of a synced pair.
-        # In sync mode, we check if the normalized path is in the set of synced paths.
+
+        # Determine border style based on state
         norm_image_path = os.path.normcase(os.path.abspath(image_path))
-        if self.view_mode or norm_image_path in self.synced_original_paths:
+        is_synced = norm_image_path in self.synced_original_paths
+        
+        if self.view_mode:
+            is_synced = True
+
+        is_projected = is_a6_panel and self.projection_enabled
+
+        # Base style with padding
+        base_style = "padding: 3px;"
+        border_color = "transparent"
+        inner_bg_color = "transparent"
+
+        if is_synced and is_projected:
             border_color = "green"
+            inner_bg_color = "cyan"
+        elif is_synced:
+            border_color = "green"
+        elif is_projected:
+            border_color = "cyan"
         
-        image_label.setStyleSheet(f"border: 3px solid {border_color}; padding: 3px;")
+        # The inner color is achieved by setting the background of the padded area.
+        # The outer color is the border itself.
+        border_style = f"border: 3px solid {border_color}; background-color: {inner_bg_color}; {base_style}"
         
-        filename_label.setText(f"{filename}{' (Projected)' if is_a6_panel and self.projection_enabled else ''}")
+        image_label.setStyleSheet(border_style)
         
-        # Both A5 and A6 images will be scaled to the fixed size of their labels, ignoring aspect ratio
-        scaled_pixmap = pixmap.scaled(image_label.size(), Qt.IgnoreAspectRatio, Qt.SmoothTransformation)
+        filename_label.setText(f"{filename}{' (Projected)' if is_projected else ''}")
+        
+        # A5 should fill the panel, A6 should maintain aspect ratio for projection accuracy
+        scale_mode = Qt.IgnoreAspectRatio if image_label is self.a5_image_label else Qt.KeepAspectRatio
+        scaled_pixmap = pixmap.scaled(image_label.size(), scale_mode, Qt.SmoothTransformation)
         image_label.setPixmap(scaled_pixmap)
 
     def _find_pcd_path(self, a5_image_path_str: str) -> Optional[str]:
@@ -607,8 +650,54 @@ class ImageSyncTool(QMainWindow):
             QMessageBox.warning(self, "Error", "LiDAR projector module not initialized.")
             return
         self.projection_enabled = not self.projection_enabled
+        self._update_shortcut_states() # Update shortcut availability
         status = "ON" if self.projection_enabled else "OFF"
         self._update_display(f"LiDAR Projection {status}")
+
+    def _save_full_res_projection(self):
+        if not self.projection_enabled:
+            self._update_display("Projection is not enabled.")
+            return
+
+        try:
+            # Determine which image paths to use based on the current mode
+            if self.view_mode:
+                if not self.mapping_data: return
+                entry = self.mapping_data[self.view_index]
+                a6_original_path = entry['a6_original_path']
+                pcd_ref_path = entry['a5_original_path']
+                base_filename = f"view_{entry['new_filename']}"
+            else: # Sync mode
+                a6_original_path = os.path.join(self.a6_dir, self.a6_images[self.a6_index])
+                pcd_ref_path = os.path.join(self.a5_dir, self.a5_images[self.a5_index])
+                base_filename = os.path.splitext(self.a6_images[self.a6_index])[0]
+
+            pcd_path = self._find_pcd_path(pcd_ref_path)
+            if not pcd_path:
+                QMessageBox.warning(self, "PCD Error", "Could not find corresponding PCD file to create projection.")
+                return
+
+            # Perform projection on full-resolution image
+            pil_a6_image = Image.open(a6_original_path).convert("RGB")
+            pcd_cloud = self.projector._load_pcd_xyz(pcd_path)
+            
+            if pcd_cloud.size == 0:
+                QMessageBox.warning(self, "PCD Error", "PCD file is empty.")
+                return
+
+            projected_image, _, _ = self.projector.project_cloud_to_image('a6', pcd_cloud, pil_a6_image)
+
+            # Save the result
+            save_dir = os.path.join(self.synced_data_dir, 'projected_full_res')
+            os.makedirs(save_dir, exist_ok=True)
+            save_path = os.path.join(save_dir, f"{base_filename}_projected.jpg")
+            projected_image.save(save_path, "JPEG", quality=95)
+            
+            self._update_display(f"Saved full-res projection to: {os.path.basename(save_dir)}/{os.path.basename(save_path)}")
+
+        except Exception as e:
+            QMessageBox.critical(self, "Save Error", f"Failed to save full-resolution projection: {e}")
+            traceback.print_exc()
 
     def _save_pair(self):
         src_a5_path = os.path.join(self.a5_dir, self.a5_images[self.a5_index])
@@ -619,11 +708,13 @@ class ImageSyncTool(QMainWindow):
             QMessageBox.warning(self, "PCD Error", "Could not find corresponding PCD file for the A5 image.")
             return
 
+        abs_a5_path = os.path.abspath(src_a5_path)
         abs_a6_path = os.path.abspath(src_a6_path)
         abs_pcd_path = os.path.abspath(src_pcd_path)
 
-        if abs_a6_path in self.synced_original_paths or abs_pcd_path in self.synced_original_paths:
-            QMessageBox.warning(self, "Duplicate Error", "Selected A6 image or PCD file is already part of another pair.")
+        # Check for duplicates using normalized paths
+        if any(os.path.normcase(p) in self.synced_original_paths for p in [abs_a5_path, abs_a6_path, abs_pcd_path]):
+            QMessageBox.warning(self, "Duplicate Error", "One or more selected files are already part of another pair.")
             return
 
         os.makedirs(self.synced_a6_dir, exist_ok=True)
@@ -631,15 +722,17 @@ class ImageSyncTool(QMainWindow):
         os.makedirs(self.projected_results_dir, exist_ok=True)
 
         base_filename = f"{self.sync_counter:010d}"
-        new_img_filename = f"{base_filename}.png"
+        new_synced_img_filename = f"{base_filename}.png"
+        new_projected_img_filename = f"{base_filename}.jpg"
         new_pcd_filename = f"{base_filename}.pcd"
 
-        dest_a6_path = os.path.join(self.synced_a6_dir, new_img_filename)
+        dest_a6_path = os.path.join(self.synced_a6_dir, new_synced_img_filename)
         dest_pcd_path = os.path.join(self.synced_pcd_dir, new_pcd_filename)
-        dest_proj_path = os.path.join(self.projected_results_dir, new_img_filename)
+        dest_proj_path = os.path.join(self.projected_results_dir, new_projected_img_filename)
 
         try:
-            shutil.copy2(src_a6_path, dest_a6_path)
+            # Open and save the A6 image to ensure it's in PNG format for consistency in view mode
+            Image.open(src_a6_path).convert("RGB").save(dest_a6_path, "PNG")
             shutil.copy2(src_pcd_path, dest_pcd_path)
 
             if self.projector:
@@ -647,7 +740,8 @@ class ImageSyncTool(QMainWindow):
                 pcd_cloud = self.projector._load_pcd_xyz(src_pcd_path)
                 if pcd_cloud.size > 0:
                     projected_image, _, _ = self.projector.project_cloud_to_image('a6', pcd_cloud, pil_a6_image)
-                    projected_image.save(dest_proj_path)
+                    # Save projected image as JPEG with high quality
+                    projected_image.save(dest_proj_path, "JPEG", quality=95)
 
         except Exception as e:
             QMessageBox.critical(self, "File Save Error", f"An error occurred while saving files: {e}")
@@ -657,13 +751,17 @@ class ImageSyncTool(QMainWindow):
         mapping_entry = {
             "id": self.sync_counter, 
             "new_filename": base_filename, 
-            "a5_original_path": os.path.abspath(src_a5_path),
+            "a5_original_path": abs_a5_path,
             "a6_original_path": abs_a6_path,
             "pcd_original_path": abs_pcd_path
         }
         
         self.mapping_data.append(mapping_entry)
-        self.synced_original_paths.update([abs_a6_path, abs_pcd_path])
+        
+        # Correctly update the set with all normalized paths for immediate UI feedback
+        self.synced_original_paths.add(os.path.normcase(abs_a5_path))
+        self.synced_original_paths.add(os.path.normcase(abs_a6_path))
+        self.synced_original_paths.add(os.path.normcase(abs_pcd_path))
         
         self.mapping_data.sort(key=lambda x: x['id'])
         self._save_mapping_data()
@@ -686,9 +784,20 @@ class ImageSyncTool(QMainWindow):
         reply = QMessageBox.question(self, "Confirm Deletion", f"Are you sure you want to delete {count} selected pair(s)?",
                                      QMessageBox.Yes | QMessageBox.No, QMessageBox.No)
         if reply == QMessageBox.Yes:
+            entries_to_delete = [self.mapping_data[i] for i in indices]
+
+            # 1. Perform file system and state modifications
+            for entry in entries_to_delete:
+                self._perform_delete_actions(entry)
+
+            # 2. Modify the main data list
             for index in sorted(indices, reverse=True):
-                if 0 <= index < len(self.mapping_data):
-                    self._perform_delete(index, self.mapping_data[index])
+                del self.mapping_data[index]
+
+            # 3. Update UI and save state
+            self.sync_counter = max((item.get('id', -1) for item in self.mapping_data), default=-1) + 1
+            self._save_mapping_data()
+            self.mapping_window.update_table(self.mapping_data)
             
             status_message = f"Success: Deleted {count} pair(s)!"
             if self.view_mode and not self.mapping_data:
@@ -697,15 +806,17 @@ class ImageSyncTool(QMainWindow):
                 status_message += " Switched to Sync Mode."
             self._update_display(status_message)
 
-    def _perform_delete(self, index, entry_to_delete):
+    def _perform_delete_actions(self, entry_to_delete):
+        """Handles file deletion and updates the synced_original_paths set."""
         base_filename = entry_to_delete['new_filename']
-        img_filename = f"{base_filename}.png"
+        synced_img_filename = f"{base_filename}.png"
+        projected_img_filename = f"{base_filename}.jpg"
         pcd_filename = f"{base_filename}.pcd"
 
         paths_to_delete = [
-            os.path.join(self.synced_a6_dir, img_filename),
+            os.path.join(self.synced_a6_dir, synced_img_filename),
             os.path.join(self.synced_pcd_dir, pcd_filename),
-            os.path.join(self.projected_results_dir, img_filename)
+            os.path.join(self.projected_results_dir, projected_img_filename)
         ]
         for path in paths_to_delete:
             if os.path.exists(path):
@@ -714,15 +825,11 @@ class ImageSyncTool(QMainWindow):
                 except OSError as e:
                     QMessageBox.warning(self, "File Deletion Error", f"Failed to delete file:\n{path}\nError: {e}")
 
-        del self.mapping_data[index]
-
-        self.synced_original_paths.discard(entry_to_delete['a6_original_path'])
-        self.synced_original_paths.discard(entry_to_delete.get('pcd_original_path'))
-
-        self.sync_counter = max((item.get('id', -1) for item in self.mapping_data), default=-1) + 1
-
-        self._save_mapping_data()
-        self.mapping_window.update_table(self.mapping_data)
+        # Remove the normalized paths from the tracking set
+        self.synced_original_paths.discard(os.path.normcase(entry_to_delete['a5_original_path']))
+        self.synced_original_paths.discard(os.path.normcase(entry_to_delete['a6_original_path']))
+        if entry_to_delete.get('pcd_original_path'):
+            self.synced_original_paths.discard(os.path.normcase(entry_to_delete['pcd_original_path']))
 
     def _save_mapping_data(self):
         try:
