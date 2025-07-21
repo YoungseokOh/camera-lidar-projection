@@ -47,13 +47,20 @@ DEFAULT_LIDAR_TO_WORLD = np.array([
 ])
 
 class CameraModelBase:
+    """Base class for camera projection models."""
     def project_point(self, Xc: float, Yc: float, Zc: float) -> Tuple[int, int, bool]:
         raise NotImplementedError
 
-class VADASFisheyeCameraModel:
+class VADASFisheyeCameraModel(CameraModelBase):
+    """VADAS Polynomial Fisheye Camera Model, assuming +X is forward."""
     def __init__(self, intrinsic: List[float], image_size: Optional[Tuple[int, int]] = None):
-        if len(intrinsic) < 11: raise ValueError("VADAS intrinsic must have at least 11 parameters.")
-        self.k, self.s, self.div, self.ux, self.uy = intrinsic[0:7], intrinsic[7], intrinsic[8], intrinsic[9], intrinsic[10]
+        if len(intrinsic) < 11:
+            raise ValueError("VADAS intrinsic must have at least 11 parameters.")
+        self.k = intrinsic[0:7]
+        self.s = intrinsic[7]
+        self.div = intrinsic[8]
+        self.ux = intrinsic[9]
+        self.uy = intrinsic[10]
         self.image_size = image_size
 
     def _poly_eval(self, coeffs: List[float], x: float) -> float:
@@ -63,16 +70,22 @@ class VADASFisheyeCameraModel:
         return res
 
     def project_point(self, Xc: float, Yc: float, Zc: float) -> Tuple[int, int, bool]:
-        nx, ny = -Yc, -Zc
+        nx = -Yc
+        ny = -Zc
         dist = math.hypot(nx, ny)
-        if dist < sys.float_info.epsilon: dist = sys.float_info.epsilon
-        cosPhi, sinPhi = nx / dist, ny / dist
+        if dist < sys.float_info.epsilon:
+            dist = sys.float_info.epsilon
+        cosPhi = nx / dist
+        sinPhi = ny / dist
         theta = math.atan2(dist, Xc)
-        if Xc < 0: return 0, 0, False
+        if Xc < 0:
+            return 0, 0, False
         xd = theta * self.s
-        if abs(self.div) < 1e-9: return 0, 0, False
+        if abs(self.div) < 1e-9:
+            return 0, 0, False
         rd = self._poly_eval(self.k, xd) / self.div
-        if math.isinf(rd) or math.isnan(rd): return 0, 0, False
+        if math.isinf(rd) or math.isnan(rd):
+            return 0, 0, False
         img_w_half = (self.image_size[0] / 2) if self.image_size else 0
         img_h_half = (self.image_size[1] / 2) if self.image_size else 0
         u = rd * cosPhi + self.ux + img_w_half
@@ -80,47 +93,66 @@ class VADASFisheyeCameraModel:
         return int(round(u)), int(round(v)), True
 
 class SensorInfo:
+    """Holds camera sensor information."""
     def __init__(self, name: str, model: CameraModelBase, intrinsic: List[float], extrinsic: np.ndarray, image_size: Optional[Tuple[int, int]] = None):
-        self.name, self.model, self.intrinsic, self.extrinsic, self.image_size = name, model, intrinsic, extrinsic, image_size
+        self.name = name
+        self.model = model
+        self.intrinsic = intrinsic
+        self.extrinsic = extrinsic
+        self.image_size = image_size
 
 class CalibrationDB:
+    """Manages camera calibration data."""
     def __init__(self, calib_dict: Dict[str, Any], lidar_to_world: Optional[np.ndarray] = None):
         self.sensors: Dict[str, SensorInfo] = {}
         self.lidar_to_world = lidar_to_world if lidar_to_world is not None else np.eye(4)
         for cam_name, calib_data in calib_dict.items():
-            model_type, intrinsic, extrinsic_raw, image_size = calib_data["model"], calib_data["intrinsic"], calib_data["extrinsic"], tuple(calib_data["image_size"]) if calib_data["image_size"] else None
+            model_type = calib_data["model"]
+            intrinsic = calib_data["intrinsic"]
+            extrinsic_raw = calib_data["extrinsic"]
+            image_size = tuple(calib_data["image_size"]) if calib_data["image_size"] else None
             extrinsic_matrix = self._rodrigues_to_matrix(extrinsic_raw) if len(extrinsic_raw) == 6 else np.array(extrinsic_raw).reshape(4, 4)
-            if model_type == "vadas": camera_model = VADASFisheyeCameraModel(intrinsic, image_size=image_size)
-            else: raise ValueError(f"Unsupported camera model: {model_type}.")
+            if model_type == "vadas":
+                camera_model = VADASFisheyeCameraModel(intrinsic, image_size=image_size)
+            else:
+                raise ValueError(f"Unsupported camera model: {model_type}.")
             self.sensors[cam_name] = SensorInfo(cam_name, camera_model, intrinsic, extrinsic_matrix, image_size)
 
     def _rodrigues_to_matrix(self, rvec_tvec: List[float]) -> np.ndarray:
-        tvec, rvec = np.array(rvec_tvec[0:3]).reshape(3, 1), np.array(rvec_tvec[3:6])
+        tvec = np.array(rvec_tvec[0:3]).reshape(3, 1)
+        rvec = np.array(rvec_tvec[3:6])
         theta = np.linalg.norm(rvec)
-        if theta < 1e-6: R = np.eye(3)
+        if theta < 1e-6:
+            R = np.eye(3)
         else:
             r = rvec / theta
             K = np.array([[0, -r[2], r[1]], [r[2], 0, -r[0]], [-r[1], r[0], 0]])
             R = np.eye(3) + math.sin(theta) * K + (1 - math.cos(theta)) * (K @ K)
         transform_matrix = np.eye(4)
-        transform_matrix[0:3, 0:3], transform_matrix[0:3, 3:4] = R, tvec
+        transform_matrix[0:3, 0:3] = R
+        transform_matrix[0:3, 3:4] = tvec
         return transform_matrix
 
     def get(self, name: str) -> SensorInfo:
-        if name not in self.sensors: raise ValueError(f"Sensor '{name}' not found.")
+        if name not in self.sensors:
+            raise ValueError(f"Sensor '{name}' not found.")
         return self.sensors[name]
 
 class LidarProjector:
+    """Projects LiDAR point clouds onto camera images, based on C++ reference."""
     def __init__(self, calib_db: CalibrationDB, max_range_m: float = 100.0, point_radius: int = 2):
-        self.calib_db, self.max_range_m, self.point_radius = calib_db, max_range_m, point_radius
+        self.calib_db = calib_db
+        self.max_range_m = max_range_m
+        self.point_radius = point_radius
 
     @staticmethod
     def _load_pcd_xyz(path: str) -> np.ndarray:
         if OPEN3D_AVAILABLE:
             try:
-                pcd = o3d.io.read_point_cloud(path)
+                pcd = o3d.io.read_point_cloud(str(path))
                 return np.asarray(pcd.points, dtype=np.float64) if pcd.has_points() else np.empty((0, 3))
-            except Exception as e: print(f"Warning: open3d failed to read {path}. Falling back. Error: {e}", file=sys.stderr)
+            except Exception as e:
+                print(f"Warning: open3d failed to read {path}. Falling back. Error: {e}", file=sys.stderr)
         points = []
         with open(path, 'r', encoding='utf-8') as f:
             data_started = False
@@ -128,23 +160,26 @@ class LidarProjector:
                 if data_started:
                     try:
                         parts = line.strip().split()
-                        if len(parts) >= 3: points.append([float(p) for p in parts[:3]])
-                    except (ValueError, IndexError): continue
-                elif line.startswith("DATA ascii"): data_started = True
+                        if len(parts) >= 3:
+                            points.append([float(parts[0]), float(parts[1]), float(parts[2])])
+                    except (ValueError, IndexError):
+                        continue
+                elif line.startswith("DATA ascii"):
+                    data_started = True
         return np.array(points, dtype=np.float64)
 
     def _get_color_from_distance(self, distance: float) -> Tuple[int, int, int]:
-        val = max(0.0, min(1.0, distance / self.max_range_m))
-        r, g, b = 0.0, 0.0, 0.0
-        if val < 0.25: r, g, b = 0.0, 4.0 * val, 1.0
-        elif val < 0.5: r, g, b = 0.0, 1.0, 1.0 - 4.0 * (val - 0.25)
-        elif val < 0.75: r, g, b = 4.0 * (val - 0.5), 1.0, 0.0
-        else: r, g, b = 1.0, 1.0 - 4.0 * (val - 0.75), 0.0
-        return (int(r * 255), int(g * 255), int(b * 255))
+        normalized_dist = max(0.0, min(1.0, distance / self.max_range_m))
+        if normalized_dist < 0.5:
+            r, g, b = 0, int(255 * (normalized_dist * 2)), int(255 * (1 - normalized_dist * 2))
+        else:
+            r, g, b = int(255 * ((normalized_dist - 0.5) * 2)), int(255 * (1 - (normalized_dist - 0.5) * 2)), 0
+        return (r, g, b)
 
     def project_cloud_to_image(self, sensor_name: str, cloud_xyz: np.ndarray, pil_image: Image.Image) -> Tuple[Image.Image, int, int]:
         sensor_info = self.calib_db.get(sensor_name)
-        camera_model, cam_extrinsic = sensor_info.model, sensor_info.extrinsic
+        camera_model = sensor_info.model
+        cam_extrinsic = sensor_info.extrinsic
         image_width, image_height = pil_image.size
         if isinstance(camera_model, VADASFisheyeCameraModel) and camera_model.image_size is None:
             camera_model.image_size = (image_width, image_height)
@@ -154,18 +189,20 @@ class LidarProjector:
         lidar_to_camera_transform = cam_extrinsic @ self.calib_db.lidar_to_world
         points_cam_hom = (lidar_to_camera_transform @ cloud_xyz_hom.T).T
         points_cam = points_cam_hom[:, :3]
-        in_front, on_image = 0, 0
+        in_front_of_camera_count = 0
+        on_image_count = 0
         for i in range(points_cam.shape[0]):
             Xc, Yc, Zc = points_cam[i]
-            if not (0 < Xc < 4.3 and Zc < 3): continue
-            in_front += 1
-            u, v, valid = camera_model.project_point(Xc, Yc, Zc)
-            if valid and 0 <= u < image_width and 0 <= v < image_height:
-                on_image += 1
+            if Xc <= 0 or Xc >= 4.3 or Zc >= 3:
+                continue
+            in_front_of_camera_count += 1
+            u, v, valid_projection = camera_model.project_point(Xc, Yc, Zc)
+            if valid_projection and 0 <= u < image_width and 0 <= v < image_height:
+                on_image_count += 1
                 color = self._get_color_from_distance(Xc)
                 r = self.point_radius
                 draw.ellipse((u - r, v - r, u + r, v + r), fill=color)
-        return output_image, in_front, on_image
+        return output_image, in_front_of_camera_count, on_image_count
 
 # =================================================================================
 # Part 2: GUI Application
@@ -365,8 +402,12 @@ class ImageSyncTool(QMainWindow):
                 with open(self.mapping_file, 'r', encoding='utf-8') as f: self.mapping_data = json.load(f)
                 if self.mapping_data:
                     self.sync_counter = max(item.get('id', -1) for item in self.mapping_data) + 1
-                    self.synced_original_paths.update(item['a6_original_path'] for item in self.mapping_data)
-                    self.synced_original_paths.update(item.get('pcd_original_path') for item in self.mapping_data if item.get('pcd_original_path'))
+                    for item in self.mapping_data:
+                        # Use normcase for case-insensitive path comparison
+                        self.synced_original_paths.add(os.path.normcase(item['a5_original_path']))
+                        self.synced_original_paths.add(os.path.normcase(item['a6_original_path']))
+                        if item.get('pcd_original_path'):
+                            self.synced_original_paths.add(os.path.normcase(item['pcd_original_path']))
             except Exception as e:
                 QMessageBox.warning(None, "JSON Error", f"Error parsing mapping_data.json: {e}")
                 self.mapping_data, self.sync_counter = [], 0
@@ -429,15 +470,29 @@ class ImageSyncTool(QMainWindow):
             if not self.mapping_data:
                 self.statusBar().showMessage("No saved data to display. Press 'V' to switch to Sync Mode.")
                 self.mapping_window.mapping_table.clearSelection()
+                for label in [self.a5_image_label, self.a6_image_label]:
+                    label.setPixmap(QPixmap())
+                    label.setText("")
+                for label in [self.a5_filename_label, self.a6_filename_label]:
+                    label.setText("")
                 return
-            if not (0 <= self.view_index < len(self.mapping_data)): self.view_index = len(self.mapping_data) - 1
+
+            if not (0 <= self.view_index < len(self.mapping_data)):
+                self.view_index = len(self.mapping_data) - 1 if self.mapping_data else 0
+            
             entry = self.mapping_data[self.view_index]
             base_filename = entry['new_filename']
             self.mapping_window.mapping_table.selectRow(self.view_index)
-            self.a5_image_label.setText("A5 (Reference)\nNot Saved")
-            self.a5_image_label.setPixmap(QPixmap())
-            self.a5_filename_label.setText(os.path.basename(entry['a5_original_path']))
-            self._update_panel(self.synced_a6_dir, [f"{item['new_filename']}.png" for item in self.mapping_data], self.view_index, self.a6_image_label, self.a6_filename_label, entry['a5_original_path'])
+
+            # Load and display A5 image from original path
+            a5_original_path = entry['a5_original_path']
+            a5_original_filename = os.path.basename(a5_original_path)
+            self._update_panel(os.path.dirname(a5_original_path), [a5_original_filename], 0, self.a5_image_label, self.a5_filename_label)
+
+            # Load and display A6 image (synced version)
+            a6_synced_filename = f"{base_filename}.png"
+            self._update_panel(self.synced_a6_dir, [a6_synced_filename], 0, self.a6_image_label, self.a6_filename_label, entry['a5_original_path'])
+            
             status_text = f"View Mode: {self.view_index + 1}/{len(self.mapping_data)} ({base_filename})"
         else:
             a5_path = os.path.join(self.a5_dir, self.a5_images[self.a5_index])
@@ -454,10 +509,29 @@ class ImageSyncTool(QMainWindow):
         filename = img_list[index]
         image_path = os.path.join(img_dir, filename)
         
-        is_a6_panel = (image_label is self.a6_image_label) # Add this line
+        is_a6_panel = (image_label is self.a6_image_label)
         
         try:
             pil_image = Image.open(image_path).convert("RGB")
+
+            if is_a6_panel and self.projection_enabled and self.projector:
+                # In view mode, the pcd_ref_path is the a5_original_path from mapping data.
+                # In sync mode, it's the current a5_path.
+                pcd_path = self._find_pcd_path(pcd_ref_path)
+                if pcd_path:
+                    try:
+                        cloud_xyz = self.projector._load_pcd_xyz(pcd_path)
+                        if cloud_xyz.size > 0:
+                            projected_pil, _, _ = self.projector.project_cloud_to_image('a6', cloud_xyz, pil_image)
+                            pil_image = projected_pil  # Use the projected image
+                        else:
+                            print(f"Warning: PCD file is empty: {pcd_path}", file=sys.stderr)
+                    except Exception as e:
+                        print(f"Error during projection: {e}", file=sys.stderr)
+                        traceback.print_exc()
+                elif pcd_ref_path: # Only warn if a reference path was actually provided
+                    print(f"Warning: Could not find corresponding PCD for A5 image: {os.path.basename(pcd_ref_path)}", file=sys.stderr)
+
             np_image = np.array(pil_image)
             height, width, channel = np_image.shape
             bytes_per_line = 3 * width
@@ -470,10 +544,12 @@ class ImageSyncTool(QMainWindow):
             return
         
         border_color = "transparent"
-        if not self.view_mode and os.path.abspath(image_path) in self.synced_original_paths:
+        # In view mode, all displayed images are part of a synced pair.
+        # In sync mode, we check if the normalized path is in the set of synced paths.
+        norm_image_path = os.path.normcase(os.path.abspath(image_path))
+        if self.view_mode or norm_image_path in self.synced_original_paths:
             border_color = "green"
-        elif is_a6_panel and self.projection_enabled:
-            border_color = "cyan"
+        
         image_label.setStyleSheet(f"border: 3px solid {border_color}; padding: 3px;")
         
         filename_label.setText(f"{filename}{' (Projected)' if is_a6_panel and self.projection_enabled else ''}")
