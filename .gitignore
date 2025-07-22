@@ -1,3 +1,2 @@
-error_messages.txt
-cpp/
-instructions/*.txt
+cpp/*
+*.cpp

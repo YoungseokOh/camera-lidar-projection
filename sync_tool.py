@@ -15,7 +15,7 @@ from PyQt5.QtWidgets import (QApplication, QMainWindow, QWidget, QLabel, QVBoxLa
                              QHBoxLayout, QMessageBox, QFileDialog,
                              QTableWidget, QTableWidgetItem, QHeaderView, QShortcut, QSizePolicy, QMenu, QAbstractItemView)
 from PyQt5.QtGui import QPixmap, QKeySequence, QImage
-from PyQt5.QtCore import Qt, pyqtSignal
+from PyQt5.QtCore import Qt, pyqtSignal, QThread, QObject
 
 # Try importing open3d, provide a fallback if not available
 try:
@@ -146,28 +146,7 @@ class LidarProjector:
         self.max_range_m = max_range_m
         self.point_radius = point_radius
 
-    @staticmethod
-    def _load_pcd_xyz(path: str) -> np.ndarray:
-        if OPEN3D_AVAILABLE:
-            try:
-                pcd = o3d.io.read_point_cloud(str(path))
-                return np.asarray(pcd.points, dtype=np.float64) if pcd.has_points() else np.empty((0, 3))
-            except Exception as e:
-                print(f"Warning: open3d failed to read {path}. Falling back. Error: {e}", file=sys.stderr)
-        points = []
-        with open(path, 'r', encoding='utf-8') as f:
-            data_started = False
-            for line in f:
-                if data_started:
-                    try:
-                        parts = line.strip().split()
-                        if len(parts) >= 3:
-                            points.append([float(parts[0]), float(parts[1]), float(parts[2])])
-                    except (ValueError, IndexError):
-                        continue
-                elif line.startswith("DATA ascii"):
-                    data_started = True
-        return np.array(points, dtype=np.float64)
+    
 
     def _get_color_from_distance(self, distance: float) -> Tuple[int, int, int]:
         """
@@ -235,7 +214,7 @@ class MappingWindow(QWidget):
     def __init__(self, parent=None):
         super().__init__(parent)
         self.setWindowTitle("Mapping Data")
-        self.setGeometry(800, 100, 800, 700)
+        self.resize(800, 700) # Set initial size, position will be handled by main window
         layout = QVBoxLayout(self)
         self.mapping_table = QTableWidget()
         self.mapping_table.setColumnCount(4)
@@ -283,7 +262,47 @@ class MappingWindow(QWidget):
             self.mapping_table.setItem(i, 3, QTableWidgetItem(os.path.basename(item.get('pcd_original_path', 'N/A'))))
         self.mapping_table.scrollToBottom()
 
+class PrefetchWorker(QObject):
+    """Worker to load files in a background thread."""
+    image_loaded = pyqtSignal(str, object)
+    pcd_loaded = pyqtSignal(str, object)
+
+    def load_image(self, path):
+        try:
+            if not os.path.exists(path): return
+            image = Image.open(path).convert("RGB")
+            self.image_loaded.emit(path, image)
+        except Exception as e:
+            print(f"PrefetchWorker: Failed to load image {path}: {e}", file=sys.stderr)
+
+    def load_pcd(self, path):
+        try:
+            if not os.path.exists(path): return
+            if OPEN3D_AVAILABLE:
+                pcd = o3d.io.read_point_cloud(path)
+                points = np.asarray(pcd.points, dtype=np.float64) if pcd.has_points() else np.empty((0, 3))
+            else:
+                points = []
+                with open(path, 'r', encoding='utf-8') as f:
+                    data_started = False
+                    for line in f:
+                        if data_started:
+                            try:
+                                parts = line.strip().split()
+                                if len(parts) >= 3:
+                                    points.append([float(parts[0]), float(parts[1]), float(parts[2])])
+                            except (ValueError, IndexError):
+                                continue
+                        elif line.startswith("DATA ascii"):
+                            data_started = True
+                points = np.array(points, dtype=np.float64)
+            self.pcd_loaded.emit(path, points)
+        except Exception as e:
+            print(f"PrefetchWorker: Failed to load PCD {path}: {e}", file=sys.stderr)
+
 class ImageSyncTool(QMainWindow):
+    request_load_image = pyqtSignal(str)
+    request_load_pcd = pyqtSignal(str)
     def __init__(self, parent_folder):
         super().__init__()
         self.parent_folder = os.path.abspath(parent_folder)
@@ -292,10 +311,11 @@ class ImageSyncTool(QMainWindow):
         if not self._load_frame_offsets(): return
         if not self._load_and_map_images(): return
         self._initialize_state()
+        self._setup_prefetch_thread()
         self._load_mapping_data()
         self._setup_gui()
+        self.mapping_window.update_table(self.mapping_data) # Update table after GUI is set up
         self._create_shortcuts()
-        self.mapping_window.update_table(self.mapping_data)
         self.valid = True
 
     def _center_on_screen(self):
@@ -308,6 +328,8 @@ class ImageSyncTool(QMainWindow):
                 # Temporarily show and hide to get geometry if not visible
                 self.mapping_window.show()
                 self.mapping_window.hide()
+            mapping_geo = self.mapping_window.frameGeometry()
+
             mapping_geo = self.mapping_window.frameGeometry()
 
             # Calculate total width including the gap (if any, currently 0)
@@ -334,7 +356,6 @@ class ImageSyncTool(QMainWindow):
         # Call update_display for the first time here to ensure widgets are sized correctly.
         if not hasattr(self, '_initial_display_done'):
             self._update_display()
-            self._center_on_screen()
             self._initial_display_done = True
 
         if self.valid and not self.mapping_window.isVisible():
@@ -347,6 +368,9 @@ class ImageSyncTool(QMainWindow):
 
     def closeEvent(self, event):
         self.mapping_window.close()
+        if self.prefetch_thread:
+            self.prefetch_thread.quit()
+            self.prefetch_thread.wait()
         super().closeEvent(event)
 
     def _setup_paths(self):
@@ -407,18 +431,21 @@ class ImageSyncTool(QMainWindow):
         self.last_status_message, self.view_mode, self.view_index = "", False, 0
         self.synced_original_paths = set()
         self.projector, self.projection_enabled = None, False
+        self.prefetch_thread, self.prefetch_worker = None, None
         
         # --- Caching Initialization ---
         self.projection_cache = OrderedDict()
-        self.MAX_CACHE_SIZE = 50  # Store up to 50 projected images
-        
+        self.image_cache = OrderedDict()
+        self.pcd_cache = OrderedDict()
+        self.MAX_CACHE_SIZE = 50  # For rendered pixmaps
+        self.MAX_DATA_CACHE_SIZE = 100  # For raw data like images and pcd points
+
         self._initialize_projector()
 
     def _initialize_projector(self):
         try:
             calib_db = CalibrationDB(DEFAULT_CALIB, lidar_to_world=DEFAULT_LIDAR_TO_WORLD)
             self.projector = LidarProjector(calib_db)
-            print("✅ LiDAR Projector initialized successfully.")
         except Exception as e:
             print(f"❌ Failed to initialize LiDAR Projector: {e}", file=sys.stderr)
 
@@ -437,6 +464,8 @@ class ImageSyncTool(QMainWindow):
             except Exception as e:
                 QMessageBox.warning(None, "JSON Error", f"Error parsing mapping_data.json: {e}")
                 self.mapping_data, self.sync_counter = [], 0
+        else:
+            pass # No mapping file, initialize empty mapping data
 
     def _setup_gui(self):
         self.setWindowTitle("Image Sync & LiDAR Projection Tool")
@@ -464,7 +493,7 @@ class ImageSyncTool(QMainWindow):
             layout.addWidget(filename_label)
             layout.addWidget(image_label, 1) # Image label takes remaining space
             image_layout.addLayout(layout, 1)
-        self.mapping_window = MappingWindow()
+        self.mapping_window = MappingWindow() # Pass no parent to make it a top-level window
         self.mapping_window.delete_requested.connect(self._request_delete_pairs)
         self.statusBar().showMessage("Ready. Press 'P' to toggle LiDAR projection.")
 
@@ -536,6 +565,47 @@ class ImageSyncTool(QMainWindow):
         if status_message: self.last_status_message = status_message
         if self.last_status_message: status_text += f" | {self.last_status_message}"
         self.statusBar().showMessage(status_text)
+        self._request_prefetch()
+
+    def _load_pcd_with_cache(self, pcd_path: str) -> Optional[np.ndarray]:
+        """Loads a PCD file, using a cache to avoid re-reading from disk."""
+        if pcd_path in self.pcd_cache:
+            self.pcd_cache.move_to_end(pcd_path)  # Mark as recently used
+            return self.pcd_cache[pcd_path]
+
+        if not os.path.exists(pcd_path):
+            return None
+
+        try:
+            if OPEN3D_AVAILABLE:
+                pcd = o3d.io.read_point_cloud(pcd_path)
+                points = np.asarray(pcd.points, dtype=np.float64) if pcd.has_points() else np.empty((0, 3))
+            else: # Manual parsing
+                points = []
+                with open(pcd_path, 'r', encoding='utf-8') as f:
+                    data_started = False
+                    for line in f:
+                        if data_started:
+                            try:
+                                parts = line.strip().split()
+                                if len(parts) >= 3:
+                                    points.append([float(parts[0]), float(parts[1]), float(parts[2])])
+                            except (ValueError, IndexError):
+                                continue
+                        elif line.startswith("DATA ascii"):
+                            data_started = True
+                points = np.array(points, dtype=np.float64)
+            
+            # Cache the loaded points
+            self.pcd_cache[pcd_path] = points
+            if len(self.pcd_cache) > self.MAX_DATA_CACHE_SIZE:
+                self.pcd_cache.popitem(last=False) # Remove least recently used
+            
+            return points
+
+        except Exception as e:
+            print(f"Error loading PCD {pcd_path}: {e}", file=sys.stderr)
+            return None
 
     def _update_panel(self, img_dir, img_list, index, image_label, filename_label, pcd_ref_path=None):
         filename = img_list[index]
@@ -556,17 +626,29 @@ class ImageSyncTool(QMainWindow):
         
         if pixmap is None: # If not in cache or not a projection case
             try:
-                pil_image = Image.open(image_path).convert("RGB")
+                # --- Image Caching Logic ---
+                if image_path in self.image_cache:
+                    pil_image = self.image_cache[image_path]
+                    self.image_cache.move_to_end(image_path) # Mark as recently used
+                else:
+                    pil_image = Image.open(image_path).convert("RGB")
+                    self.image_cache[image_path] = pil_image
+                    if len(self.image_cache) > self.MAX_DATA_CACHE_SIZE:
+                        self.image_cache.popitem(last=False)
+
+                # Start with the original image; this will be rendered unless projection is successful
+                pil_image_to_render = pil_image
 
                 if is_projected and self.projector:
                     pcd_path = self._find_pcd_path(pcd_ref_path) # Re-finding, but it's cheap
                     if pcd_path:
                         try:
-                            cloud_xyz = self.projector._load_pcd_xyz(pcd_path)
-                            if cloud_xyz.size > 0:
-                                projected_pil, _, _ = self.projector.project_cloud_to_image('a6', cloud_xyz, pil_image)
-                                pil_image = projected_pil
-                            else:
+                            cloud_xyz = self._load_pcd_with_cache(pcd_path) # Use cached loader
+                            if cloud_xyz is not None and cloud_xyz.size > 0:
+                                # Project onto a copy so the original in the cache remains clean
+                                projected_pil, _, _ = self.projector.project_cloud_to_image('a6', cloud_xyz, pil_image.copy())
+                                pil_image_to_render = projected_pil
+                            elif cloud_xyz is not None: # cloud_xyz is empty
                                 print(f"Warning: PCD file is empty: {pcd_path}", file=sys.stderr)
                         except Exception as e:
                             print(f"Error during projection: {e}", file=sys.stderr)
@@ -574,13 +656,13 @@ class ImageSyncTool(QMainWindow):
                     elif pcd_ref_path:
                         print(f"Warning: Could not find corresponding PCD for A5 image: {os.path.basename(pcd_ref_path)}", file=sys.stderr)
 
-                np_image = np.array(pil_image)
+                np_image = np.array(pil_image_to_render)
                 height, width, channel = np_image.shape
                 bytes_per_line = 3 * width
                 qimage = QImage(np_image.data, width, height, bytes_per_line, QImage.Format_RGB888)
                 pixmap = QPixmap.fromImage(qimage)
 
-                # --- Store in Cache ---
+                # --- Store in projection_cache ---
                 if is_projected and self.projector and pcd_path:
                     cache_key = (image_path, pcd_path)
                     self.projection_cache[cache_key] = pixmap
@@ -703,10 +785,10 @@ class ImageSyncTool(QMainWindow):
 
             # Perform projection on full-resolution image
             pil_a6_image = Image.open(a6_original_path).convert("RGB")
-            pcd_cloud = self.projector._load_pcd_xyz(pcd_path)
+            pcd_cloud = self._load_pcd_with_cache(pcd_path)
             
-            if pcd_cloud.size == 0:
-                QMessageBox.warning(self, "PCD Error", "PCD file is empty.")
+            if pcd_cloud is None or pcd_cloud.size == 0:
+                QMessageBox.warning(self, "PCD Error", "PCD file is empty or could not be loaded.")
                 return
 
             projected_image, _, _ = self.projector.project_cloud_to_image('a6', pcd_cloud, pil_a6_image)
@@ -761,8 +843,8 @@ class ImageSyncTool(QMainWindow):
 
             if self.projector:
                 pil_a6_image = Image.open(src_a6_path).convert("RGB")
-                pcd_cloud = self.projector._load_pcd_xyz(src_pcd_path)
-                if pcd_cloud.size > 0:
+                pcd_cloud = self._load_pcd_with_cache(src_pcd_path)
+                if pcd_cloud is not None and pcd_cloud.size > 0:
                     projected_image, _, _ = self.projector.project_cloud_to_image('a6', pcd_cloud, pil_a6_image)
                     # Save projected image as JPEG with high quality
                     projected_image.save(dest_proj_path, "JPEG", quality=95)
@@ -854,6 +936,57 @@ class ImageSyncTool(QMainWindow):
         self.synced_original_paths.discard(os.path.normcase(entry_to_delete['a6_original_path']))
         if entry_to_delete.get('pcd_original_path'):
             self.synced_original_paths.discard(os.path.normcase(entry_to_delete['pcd_original_path']))
+
+    def _setup_prefetch_thread(self):
+        self.prefetch_thread = QThread()
+        self.prefetch_worker = PrefetchWorker()
+        self.prefetch_worker.moveToThread(self.prefetch_thread)
+
+        # Connect worker signals to main thread slots
+        self.prefetch_worker.image_loaded.connect(self._update_cache_from_worker)
+        self.prefetch_worker.pcd_loaded.connect(self._update_cache_from_worker)
+
+        # Connect main thread request signals to worker slots
+        self.request_load_image.connect(self.prefetch_worker.load_image)
+        self.request_load_pcd.connect(self.prefetch_worker.load_pcd)
+
+        self.prefetch_thread.start()
+
+    def _request_prefetch(self):
+        if self.view_mode: # Prefetching is only for sync mode for now
+            return
+
+        indices_to_check = [-2, -1, 1, 2] # Prefetch 2 frames in each direction
+        for offset in indices_to_check:
+            # Prefetch A6 image
+            a6_idx = self.a6_index + offset
+            if 0 <= a6_idx < len(self.a6_images):
+                a6_path = os.path.join(self.a6_dir, self.a6_images[a6_idx])
+                if a6_path not in self.image_cache:
+                    self.request_load_image.emit(a6_path)
+
+            # Prefetch A5 image and corresponding PCD
+            a5_idx = self.a5_index + offset
+            if 0 <= a5_idx < len(self.a5_images):
+                a5_path = os.path.join(self.a5_dir, self.a5_images[a5_idx])
+                if a5_path not in self.image_cache:
+                    self.request_load_image.emit(a5_path)
+                
+                pcd_path = self._find_pcd_path(a5_path)
+                if pcd_path and pcd_path not in self.pcd_cache:
+                    self.request_load_pcd.emit(pcd_path)
+
+    def _update_cache_from_worker(self, path, data):
+        if isinstance(data, Image.Image):
+            if path not in self.image_cache:
+                self.image_cache[path] = data
+                if len(self.image_cache) > self.MAX_DATA_CACHE_SIZE:
+                    self.image_cache.popitem(last=False)
+        elif isinstance(data, np.ndarray):
+            if path not in self.pcd_cache:
+                self.pcd_cache[path] = data
+                if len(self.pcd_cache) > self.MAX_DATA_CACHE_SIZE:
+                    self.pcd_cache.popitem(last=False)
 
     def _save_mapping_data(self):
         try:
