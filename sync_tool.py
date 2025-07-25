@@ -416,13 +416,22 @@ class ImageSyncTool(QMainWindow):
             return False
         self.a5_frame_to_index = {self._parse_frame_number(f): i for i, f in enumerate(self.a5_images)}
         self.a6_frame_to_index = {self._parse_frame_number(f): i for i, f in enumerate(self.a6_images)}
+
+        # Find the start index from the frame number. If not found, default to the first image (index 0).
         self.a5_start_index = self.a5_frame_to_index.get(self.a5_start_frame)
-        self.a5_end_index = self.a5_frame_to_index.get(self.a5_end_frame)
+        if self.a5_start_index is None:
+            print(f"Warning: a5_start_frame '{self.a5_start_frame}' not found. Defaulting to the first image.", file=sys.stderr)
+            self.a5_start_index = 0
+
         self.a6_start_index = self.a6_frame_to_index.get(self.a6_start_frame)
-        self.a6_end_index = self.a6_frame_to_index.get(self.a6_end_frame)
-        if any(i is None for i in [self.a5_start_index, self.a5_end_index, self.a6_start_index, self.a6_end_index]):
-            QMessageBox.critical(None, "Error", "Could not find images corresponding to frame numbers in 'frame_offset.txt'.")
-            return False
+        if self.a6_start_index is None:
+            print(f"Warning: a6_start_frame '{self.a6_start_frame}' not found. Defaulting to the first image.", file=sys.stderr)
+            self.a6_start_index = 0
+
+        # The end index is now the end of the list, ignoring the file's end_frame.
+        self.a5_end_index = len(self.a5_images) - 1 if self.a5_images else 0
+        self.a6_end_index = len(self.a6_images) - 1 if self.a6_images else 0
+
         return True
 
     def _initialize_state(self):
@@ -714,8 +723,23 @@ class ImageSyncTool(QMainWindow):
         return pcd_path if os.path.exists(pcd_path) else None
 
     def _navigate_index(self, idx_attr, start_attr, end_attr, step, msg):
-        current, start, end = getattr(self, idx_attr), getattr(self, start_attr), getattr(self, end_attr)
-        new_index = current - 1 if step == -1 and current > start else (end if step == -1 else (current + 1 if current < end else start))
+        current = getattr(self, idx_attr)
+        start = getattr(self, start_attr)
+        end = getattr(self, end_attr)
+
+        new_index = current  # Default to current index
+
+        if step > 0:  # Moving forward
+            if current >= end:
+                new_index = start  # At the end, loop to the start
+            else:
+                new_index = current + 1
+        elif step < 0:  # Moving backward
+            if current <= start:
+                new_index = end  # At the start, loop to the end
+            else:
+                new_index = current - 1
+            
         setattr(self, idx_attr, new_index)
         self._update_display(msg)
 
