@@ -210,6 +210,7 @@ class LidarProjector:
 
 class MappingWindow(QWidget):
     delete_requested = pyqtSignal(list)
+    item_double_clicked = pyqtSignal(int) # Add this line
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -227,6 +228,7 @@ class MappingWindow(QWidget):
         self.mapping_table.setEditTriggers(QTableWidget.NoEditTriggers)
         self.mapping_table.setContextMenuPolicy(Qt.CustomContextMenu)
         self.mapping_table.customContextMenuRequested.connect(self.open_menu)
+        self.mapping_table.doubleClicked.connect(self._on_item_double_clicked) # Add this line
         self.mapping_table.setStyleSheet('QTableWidget::item:selected { background-color: #FFFFE0; color: black; }')
         layout.addWidget(self.mapping_table)
 
@@ -235,6 +237,10 @@ class MappingWindow(QWidget):
             self.handle_deletion()
         else:
             super().keyPressEvent(event)
+
+    def _on_item_double_clicked(self, index):
+        """Emits a signal with the row index when an item is double-clicked."""
+        self.item_double_clicked.emit(index.row())
 
     def open_menu(self, position):
         selected_rows = self.get_selected_rows()
@@ -504,6 +510,7 @@ class ImageSyncTool(QMainWindow):
             image_layout.addLayout(layout, 1)
         self.mapping_window = MappingWindow() # Pass no parent to make it a top-level window
         self.mapping_window.delete_requested.connect(self._request_delete_pairs)
+        self.mapping_window.item_double_clicked.connect(self._on_mapping_item_double_clicked) # Add this line
         self.statusBar().showMessage("Ready. Press 'P' to toggle LiDAR projection.")
 
     def _create_shortcuts(self):
@@ -523,6 +530,17 @@ class ImageSyncTool(QMainWindow):
             'save_projection': QShortcut(QKeySequence("Ctrl+S"), self, self._save_full_res_projection),
         }
         self._update_shortcut_states()
+
+    def _on_mapping_item_double_clicked(self, row_index: int):
+        """Handles double-click on a mapping table item to display the corresponding scene."""
+        if not self.mapping_data:
+            return
+        
+        self.view_mode = True
+        self.view_index = row_index
+        self.projection_enabled = True # Enable projection by default when viewing a scene
+        self._update_shortcut_states()
+        self._update_display(f"Moved to saved pair ID {self.mapping_data[row_index].get('id', 'N/A')}")
 
     def _update_shortcut_states(self):
         is_sync_mode = not self.view_mode

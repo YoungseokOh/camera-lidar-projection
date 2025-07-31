@@ -17,6 +17,12 @@
     *   투영된 비교 이미지를 화면에 직접 표시하는 대신, 지정된 상위 폴더 내의 `comparison_results`라는 새 폴더에 JPEG 파일로 저장하도록 변경되었습니다.
     *   저장되는 이미지는 원본 크기에서 너비 1280픽셀로 리사이즈되어 파일 크기를 줄이고 관리가 용이하도록 했습니다.
 
+**3. `sync_tool.py` 파일 수정:**
+*   **매핑 테이블 더블 클릭 기능 추가:** `MappingWindow`에서 매핑 테이블 항목을 더블 클릭했을 때, 해당 장면으로 메인 뷰어를 이동시키고 LiDAR 투영을 자동으로 활성화하는 기능을 추가했습니다.
+    *   `MappingWindow` 클래스에 `item_double_clicked` PyQt 시그널을 정의했습니다.
+    *   `MappingWindow`의 `doubleClicked` 시그널을 `_on_item_double_clicked` 메서드에 연결하여 `item_double_clicked` 시그널을 방출하도록 했습니다.
+    *   `ImageSyncTool`에서 `MappingWindow`의 `item_double_clicked` 시그널을 받아 `_on_mapping_item_double_clicked` 메서드를 통해 뷰 모드 전환 및 장면 이동을 처리하도록 구현했습니다.
+
 이러한 변경 사항은 LiDAR-카메라 투영 비교의 유연성, 시각적 명확성 및 사용 편의성을 향상시킵니다.
 
 ---
