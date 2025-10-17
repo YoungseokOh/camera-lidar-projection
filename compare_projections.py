@@ -230,8 +230,6 @@ class LidarCameraProjector:
         in_front_of_camera_count = 0
         on_image_count = 0
         
-
-
         for i in range(points_cam.shape[0]):
             Xc, Yc, Zc = points_cam[i]
             

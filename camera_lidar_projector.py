@@ -200,15 +200,12 @@ class LidarCameraProjector:
         # C++ logic: L2CExtrinsic = extrinsic * L2WMatrix;
         # This means cam_extrinsic is World->Cam, not Cam->World. No inversion needed.
         lidar_to_camera_transform = cam_extrinsic @ self.calib_db.lidar_to_world
-        
         points_cam_hom = (lidar_to_camera_transform @ cloud_xyz_hom.T).T
         points_cam = points_cam_hom[:, :3]
 
         in_front_of_camera_count = 0
         on_image_count = 0
         
-
-
         for i in range(points_cam.shape[0]):
             Xc, Yc, Zc = points_cam[i]
             

@@ -9,8 +9,7 @@ from typing import Dict, List, Tuple, Optional, Any
 from tqdm import tqdm
 
 import numpy as np
-from PIL import Image
-import cv2
+import cv2 # Use cv2 instead of PIL
 
 # Try importing open3d, provide a fallback if not available
 try:
@@ -147,8 +146,13 @@ def load_pcd_xyz(path: Path) -> np.ndarray:
                 data_started = True
     return np.array(points, dtype=np.float64)
 
-def load_image(path: Path) -> Image.Image:
-    return Image.open(path)
+# Modified load_image to use cv2
+def load_image(path: Path) -> np.ndarray:
+    """Loads an image using OpenCV."""
+    img = cv2.imread(str(path))
+    if img is None:
+        raise IOError(f"Could not load image from {path}")
+    return img
 
 class LidarCameraProjector:
     """Projects LiDAR point clouds to create depth maps."""
@@ -167,6 +171,16 @@ class LidarCameraProjector:
         depth_map = np.zeros((image_height, image_width), dtype=np.float32)
         
         cloud_xyz_hom = np.hstack((cloud_xyz, np.ones((cloud_xyz.shape[0], 1))))
+        # Define the exclusion condition based on Y and X coordinates
+        # Exclude points where (Y <= 0.5 and Y >= -0.7) AND (X >= 0.0)
+        exclude_y_condition = (cloud_xyz_hom[:, 1] <= 0.5) & (cloud_xyz_hom[:, 1] >= -0.7)
+        exclude_x_condition = (cloud_xyz_hom[:, 0] >= 0.0)
+        
+        # Combine conditions to get points to EXCLUDE
+        points_to_exclude = exclude_y_condition & exclude_x_condition
+        
+        # Keep only the points that are NOT in the exclusion set
+        cloud_xyz_hom = cloud_xyz_hom[~points_to_exclude]
         lidar_to_camera_transform = cam_extrinsic @ self.calib_db.lidar_to_world
         points_cam_hom = (lidar_to_camera_transform @ cloud_xyz_hom.T).T
         points_cam = points_cam_hom[:, :3]
@@ -186,11 +200,12 @@ class LidarCameraProjector:
         
         return depth_map
 
+# Modified save_depth_map to use cv2
 def save_depth_map(path: Path, depth_map: np.ndarray):
     """Saves a depth map as a 16-bit PNG image, following KITTI conventions."""
     depth_map_uint16 = (depth_map * 256.0).astype(np.uint16)
-    image = Image.fromarray(depth_map_uint16, mode='I;16')
-    image.save(path)
+    # For 16-bit PNG, use cv2.imwrite with IMWRITE_PNG_BIT_DEPTH
+    cv2.imwrite(str(path), depth_map_uint16, [cv2.IMWRITE_PNG_BIT_DEPTH, 16])
 
 def process_folder(projector: LidarCameraProjector, parent_folder: Path, cam_name: str, output_dir: Path):
     synced_data_dir = parent_folder / "synced_data"
@@ -234,10 +249,12 @@ def process_folder(projector: LidarCameraProjector, parent_folder: Path, cam_nam
                     continue
 
             try:
-                pil_image = load_image(image_path)
+                # Use cv2.imread, which returns a numpy array
+                cv2_image = load_image(image_path)
                 cloud_xyz = load_pcd_xyz(pcd_path)
 
-                depth_map = projector.project_cloud_to_depth_map(cam_name, cloud_xyz, pil_image.size)
+                # Pass image size as (width, height) tuple
+                depth_map = projector.project_cloud_to_depth_map(cam_name, cloud_xyz, (cv2_image.shape[1], cv2_image.shape[0]))
 
                 if depth_map is not None:
                     output_filename = output_dir / f"{image_path.stem}.png"
@@ -273,10 +290,10 @@ def process_folder(projector: LidarCameraProjector, parent_folder: Path, cam_nam
                     continue
 
             try:
-                pil_image = load_image(image_path)
+                cv2_image = load_image(image_path)
                 cloud_xyz = load_pcd_xyz(pcd_path)
 
-                depth_map = projector.project_cloud_to_depth_map(cam_name, cloud_xyz, pil_image.size)
+                depth_map = projector.project_cloud_to_depth_map(cam_name, cloud_xyz, (cv2_image.shape[1], cv2_image.shape[0]))
 
                 if depth_map is not None:
                     output_filename = output_dir / f"{image_path.stem}.png"

@@ -35,7 +35,8 @@ DEFAULT_CALIB = {
     "intrinsic": [-0.0004, 1.0136, -0.0623, 0.2852, -0.332, 0.1896, -0.0391,
                   1.0447, 0.0021, 44.9516, 2.48822, 0, 0.9965, -0.0067,
                   -0.0956, 0.1006, -0.054, 0.0106],
-    "extrinsic": [0.0900425, -0.00450864, -0.356367, 0.00100918, -0.236104, -0.0219886],
+    # "extrinsic": [0.0900425, -0.00450864, -0.356367, 0.00100918, -0.236104, -0.0219886],
+    "extrinsic": [ 0.293769, -0.0542026, -0.631615, -0.00394431, -0.33116, -0.00963617 ],
     "image_size": None
   }
 }
@@ -79,8 +80,8 @@ class VADASFisheyeCameraModel(CameraModelBase):
         cosPhi = nx / dist
         sinPhi = ny / dist
         theta = math.atan2(dist, Xc)
-        if Xc < 0:
-            return 0, 0, False
+        # if Xc < 0:
+        #     return 0, 0, False
         xd = theta * self.s
         if abs(self.div) < 1e-9:
             return 0, 0, False
@@ -185,6 +186,18 @@ class LidarProjector:
         output_image = pil_image.copy()
         draw = ImageDraw.Draw(output_image)
         cloud_xyz_hom = np.hstack((cloud_xyz, np.ones((cloud_xyz.shape[0], 1))))
+        
+        # Define the exclusion condition based on Y and X coordinates
+        # Exclude points where (Y <= 0.5 and Y >= -0.7) AND (X >= 0.0)
+        exclude_y_condition = (cloud_xyz_hom[:, 1] <= 0.5) & (cloud_xyz_hom[:, 1] >= -0.7)
+        exclude_x_condition = (cloud_xyz_hom[:, 0] >= 0.0)
+        
+        # Combine conditions to get points to EXCLUDE
+        points_to_exclude = exclude_y_condition & exclude_x_condition
+        
+        # Keep only the points that are NOT in the exclusion set
+        cloud_xyz_hom = cloud_xyz_hom[~points_to_exclude]
+
         lidar_to_camera_transform = cam_extrinsic @ self.calib_db.lidar_to_world
         points_cam_hom = (lidar_to_camera_transform @ cloud_xyz_hom.T).T
         points_cam = points_cam_hom[:, :3]
@@ -192,9 +205,11 @@ class LidarProjector:
         on_image_count = 0
         for i in range(points_cam.shape[0]):
             Xc, Yc, Zc = points_cam[i]
+
             # Filter points behind the camera, but remove other distance/height restrictions
-            if Xc <= 0:
-                continue
+            # if Xc <= 0:
+            #     continue
+
             in_front_of_camera_count += 1
             u, v, valid_projection = camera_model.project_point(Xc, Yc, Zc)
             if valid_projection and 0 <= u < image_width and 0 <= v < image_height:

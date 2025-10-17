@@ -2,7 +2,7 @@ import os
 import json
 import numpy as np
 import cv2
-from PIL import Image
+# from PIL import Image # Removed PIL import
 import sys
 from calibration_data import DEFAULT_CALIB
 
@@ -28,15 +28,23 @@ def load_depth_map_png(file_path):
     KITTI 데이터셋 표준에 따라 16비트 픽셀 값을 256.0으로 나누어 실제 거리(미터)로 변환합니다.
     """
     try:
-        img = Image.open(file_path)
-        if img.mode != 'I;16':
-            print(f"경고: {file_path}는 16비트 그레이스케일 PNG가 아닐 수 있습니다. 현재 모드: {img.mode}")
+        # Use cv2.imread with IMREAD_UNCHANGED to load 16-bit image
+        img = cv2.imread(str(file_path), cv2.IMREAD_UNCHANGED)
+        if img is None:
+            print(f"Error: Could not load image from {file_path}", file=sys.stderr)
+            return None
+        
+        # Ensure it's 16-bit (CV_16U)
+        if img.dtype != np.uint16:
+            print(f"Warning: {file_path}는 16비트 이미지가 아닐 수 있습니다. 현재 dtype: {img.dtype}", file=sys.stderr)
+            # Attempt to convert if it's a different type, but warn
+            img = img.astype(np.uint16)
         
         depth_map_pixels = np.array(img, dtype=np.float32)
         depth_map_meters = depth_map_pixels / 256.0
         return depth_map_meters
     except Exception as e:
-        print(f"PNG 깊이 맵 로드 중 오류 발생 ({file_path}): {e}")
+        print(f"PNG 깊이 맵 로드 중 오류 발생 ({file_path}): {e}", file=sys.stderr)
         return None
 
 def update_display_image():
@@ -197,5 +205,5 @@ def main(base_data_path, pcd_filename):
 
 if __name__ == "__main__":
     base_data_directory = r"C:\Users\seok436\Documents\VSCode\Projects\Camera-LiDAR-Projection\ncdb-cls-sample\synced_data"
-    pcd_to_visualize = "0000001996.pcd" 
+    pcd_to_visualize = "0000000931.pcd" 
     main(base_data_directory, pcd_to_visualize)
