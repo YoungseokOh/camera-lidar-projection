@@ -15,15 +15,112 @@ import cv2
 from PyQt5.QtWidgets import (
     QApplication, QMainWindow, QWidget, QHBoxLayout, QVBoxLayout,
     QLabel, QPushButton, QFileDialog, QSpinBox, QGroupBox, QSlider,
-    QCheckBox
+    QCheckBox, QComboBox
 )
 from PyQt5.QtCore import Qt
-from PyQt5.QtGui import QPixmap
+from PyQt5.QtGui import QPixmap, QImage
+
+try:
+    import matplotlib
+    from matplotlib.colors import ListedColormap, LinearSegmentedColormap
+    import matplotlib.cm as mpl_cm
+except ImportError:
+    matplotlib = None
+    ListedColormap = None
+    LinearSegmentedColormap = None
+    mpl_cm = None
+
+_HAS_MPL_COLORMAPS = bool(matplotlib) and hasattr(matplotlib, "colormaps")
+
+
+def get_colormap(name: str):
+    if matplotlib is None:
+        raise RuntimeError("matplotlib is required for colormap rendering")
+    try:
+        if _HAS_MPL_COLORMAPS:
+            return matplotlib.colormaps.get_cmap(name)
+        if mpl_cm is not None:
+            return mpl_cm.get_cmap(name)
+    except Exception:
+        pass
+    fallback = "viridis"
+    if _HAS_MPL_COLORMAPS:
+        return matplotlib.colormaps.get_cmap(fallback)
+    if mpl_cm is not None:
+        return mpl_cm.get_cmap(fallback)
+    raise RuntimeError("No matplotlib colormap access available")
+
+
+def register_colormap(name: str, cmap) -> None:
+    if matplotlib is None or cmap is None:
+        return
+    if _HAS_MPL_COLORMAPS:
+        try:
+            existing = getattr(matplotlib.colormaps, "names", None)
+            if existing is not None and name in existing:
+                return
+            matplotlib.colormaps.register(cmap, name=name)
+        except Exception:
+            pass
+    elif mpl_cm is not None:
+        try:
+            mpl_cm.get_cmap(name)
+        except ValueError:
+            mpl_cm.register_cmap(name=name, cmap=cmap)
+
+
+ERROR_PERCENT_MAX = 20.0
+ERROR_COLORMAP_NAME = "error_blue"
+ERROR_COLORMAP_POINTS = [
+    (0.0, "#ffffff"),                              # 0%
+    (0.0015, "#f8fbff"),                           # 0.03%
+    (0.015, "#e9f3ff"),                            # 0.3%
+    (0.05, "#cde4ff"),                             # 1%
+    (0.25, "#9bc7ff"),                             # 5%
+    (0.75, "#4a76d6"),                             # 15%
+    (1.0, "#0b2f78"),                              # ≥20%
+]
+
+ERROR_LEGEND_ENTRIES = [
+    ("0 – 0.03%", "#ffffff"),
+    ("0.03 – 1%", "#dcecff"),
+    ("1 – 5%", "#aacdff"),
+    ("5 – 20%", "#4a76d6"),
+    ("≥ 20%", "#0b2f78"),
+]
+
+ERROR_LEGEND_FONT_SIZE = 8
+ERROR_LEGEND_TEXT_COLOR = (0.0, 0.0, 0.0)
+ERROR_LEGEND_USE_BACKGROUND = False
+ERROR_LEGEND_BACKGROUND_COLOR = (0.97, 0.94, 0.83, 0.0)
+ERROR_LEGEND_SHOW_BORDER = True
+# ERROR_LEGEND_POSITION = (0.85, 0.78)  # Not used - legend uses default upper right position
+ERROR_LEGEND_SIZE = (0.22, 0.18)
+
+if matplotlib is not None and LinearSegmentedColormap is not None:
+    try:
+        _error_cmap = LinearSegmentedColormap.from_list(
+            ERROR_COLORMAP_NAME,
+            ERROR_COLORMAP_POINTS,
+            N=256
+        )
+        register_colormap(ERROR_COLORMAP_NAME, _error_cmap)
+    except Exception:
+        _error_cmap = None
+else:
+    _error_cmap = None
 
 try:
     import pyvista as pv
     from pyvistaqt import QtInteractor
     PYVISTA_AVAILABLE = True
+    if matplotlib is not None and ListedColormap is not None:
+        _SOLID_CMAPS = {
+            "solid_cyan": ListedColormap([[0.0, 1.0, 1.0, 1.0]]),
+            "solid_magenta": ListedColormap([[1.0, 0.0, 1.0, 1.0]]),
+        }
+        for _name, _cmap in _SOLID_CMAPS.items():
+            register_colormap(_name, _cmap)
 except ImportError:
     PYVISTA_AVAILABLE = False
     print("Warning: pyvista or pyvistaqt not installed.")
@@ -31,6 +128,7 @@ except ImportError:
 
 from calibration_data import DEFAULT_LIDAR_TO_CAM, DEFAULT_LIDAR_TO_WORLD_v1, DEFAULT_CALIB
 import math
+
 
 
 def depth_map_to_point_cloud_vadas(
@@ -315,6 +413,38 @@ class ProjectionComparisonWindow(QMainWindow):
         self.pred_dir = results_dir / "pred"
         self.default_camera = None
         self.keep_camera_state = False
+        self._zoom_last_scale = None
+        self.last_gt_depth = None
+        self.last_pred_depth = None
+        self.last_error_map = None
+        self.show_error_checkbox = None
+        self.error_legend_actor = None
+
+        # Sequential/qualitative colormap presets to reduce desaturation toward white
+        self.colormap_presets = [
+            ("Viridis (balanced)", "viridis"),
+            ("Viridis (reverse)", "viridis_r"),
+            ("Turbo (vivid)", "turbo"),
+            ("Turbo (reverse)", "turbo_r"),
+            ("Magma (warm dark)", "magma"),
+            ("Magma (reverse)", "magma_r"),
+            ("Cividis (perceptual)", "cividis"),
+            ("Cividis (reverse)", "cividis_r"),
+            ("Plasma (warm)", "plasma"),
+            ("Plasma (reverse)", "plasma_r"),
+            ("Inferno (glow)", "inferno"),
+            ("Inferno (reverse)", "inferno_r"),
+            ("Spectral (diverging)", "Spectral"),
+            ("Spectral (reverse)", "Spectral_r"),
+        ]
+        if matplotlib is not None:
+            self.colormap_presets.extend([
+                ("Solid Cyan", "solid_cyan"),
+                ("Solid Magenta", "solid_magenta"),
+            ])
+        self.error_colormap_name = ERROR_COLORMAP_NAME if matplotlib is not None else "viridis"
+        self.gt_colormap_name = self.colormap_presets[0][1]
+        self.pred_colormap_name = self.colormap_presets[1][1]
         
         # Get list of available samples
         self.sample_files = sorted(list(self.rgb_dir.glob("*.png")))
@@ -446,32 +576,66 @@ class ProjectionComparisonWindow(QMainWindow):
         control_layout = QVBoxLayout()
         
         # Visibility checkboxes
-        visibility_layout = QHBoxLayout()
+        checkbox_layout = QHBoxLayout()
+
         self.show_gt_checkbox = QCheckBox("Show GT")
         self.show_gt_checkbox.setChecked(True)
         self.show_gt_checkbox.stateChanged.connect(self.on_visibility_changed)
-        visibility_layout.addWidget(self.show_gt_checkbox)
-        
+        checkbox_layout.addWidget(self.show_gt_checkbox)
+
         self.show_pred_checkbox = QCheckBox("Show Pred")
         self.show_pred_checkbox.setChecked(True)
         self.show_pred_checkbox.stateChanged.connect(self.on_visibility_changed)
-        visibility_layout.addWidget(self.show_pred_checkbox)
-        
+        checkbox_layout.addWidget(self.show_pred_checkbox)
+
         self.show_axes_checkbox = QCheckBox("Show Axes")
         self.show_axes_checkbox.setChecked(True)
         self.show_axes_checkbox.stateChanged.connect(self.on_visibility_changed)
-        visibility_layout.addWidget(self.show_axes_checkbox)
-        
-        visibility_layout.addStretch()
-        control_layout.addLayout(visibility_layout)
+        checkbox_layout.addWidget(self.show_axes_checkbox)
 
-        mask_layout = QHBoxLayout()
         self.match_pred_to_gt_checkbox = QCheckBox("Pred uses GT mask")
         self.match_pred_to_gt_checkbox.setChecked(True)
         self.match_pred_to_gt_checkbox.stateChanged.connect(self.on_visibility_changed)
-        mask_layout.addWidget(self.match_pred_to_gt_checkbox)
-        mask_layout.addStretch()
-        control_layout.addLayout(mask_layout)
+        checkbox_layout.addWidget(self.match_pred_to_gt_checkbox)
+
+        self.show_error_checkbox = QCheckBox("Show Error")
+        self.show_error_checkbox.setChecked(False)
+        self.show_error_checkbox.stateChanged.connect(self.on_show_error_changed)
+        checkbox_layout.addWidget(self.show_error_checkbox)
+
+        checkbox_layout.addStretch()
+        control_layout.addLayout(checkbox_layout)
+
+        # Colormap selectors
+        cmap_layout = QHBoxLayout()
+        cmap_layout.addWidget(QLabel("GT Colormap:"))
+        self.gt_cmap_combo = QComboBox()
+        for label, cmap_name in self.colormap_presets:
+            self.gt_cmap_combo.addItem(label, cmap_name)
+        self.gt_cmap_combo.blockSignals(True)
+        self.gt_cmap_combo.setCurrentIndex(0)
+        self.gt_cmap_combo.blockSignals(False)
+        self.gt_cmap_combo.currentIndexChanged.connect(self.on_gt_cmap_changed)
+        self.gt_colormap_name = self.gt_cmap_combo.currentData()
+        cmap_layout.addWidget(self.gt_cmap_combo)
+
+        cmap_layout.addWidget(QLabel("Pred Colormap:"))
+        self.pred_cmap_combo = QComboBox()
+        for label, cmap_name in self.colormap_presets:
+            self.pred_cmap_combo.addItem(label, cmap_name)
+        # Choose a more vivid default for prediction contrast (Turbo)
+        pred_default_index = next(
+            (i for i, (label, _) in enumerate(self.colormap_presets) if "Turbo (vivid)" in label),
+            1 if len(self.colormap_presets) > 1 else 0
+        )
+        self.pred_cmap_combo.blockSignals(True)
+        self.pred_cmap_combo.setCurrentIndex(pred_default_index)
+        self.pred_cmap_combo.blockSignals(False)
+        self.pred_cmap_combo.currentIndexChanged.connect(self.on_pred_cmap_changed)
+        self.pred_colormap_name = self.pred_cmap_combo.currentData()
+        cmap_layout.addWidget(self.pred_cmap_combo)
+        cmap_layout.addStretch()
+        control_layout.addLayout(cmap_layout)
         
         # GT Transparency slider
         gt_transparency_layout = QHBoxLayout()
@@ -504,16 +668,17 @@ class ProjectionComparisonWindow(QMainWindow):
         zoom_layout = QHBoxLayout()
         zoom_layout.addWidget(QLabel("Zoom:"))
         self.zoom_slider = QSlider(Qt.Horizontal)
-        self.zoom_slider.setMinimum(25)
-        self.zoom_slider.setMaximum(400)
-        self.zoom_slider.setSingleStep(5)
-        self.zoom_slider.setValue(100)
+        self.zoom_slider.setMinimum(0)
+        self.zoom_slider.setMaximum(100)
+        self.zoom_slider.setSingleStep(1)
+        self.zoom_slider.setValue(50)
         self.zoom_slider.valueChanged.connect(self.on_zoom_changed)
         zoom_layout.addWidget(self.zoom_slider)
-        self.zoom_label = QLabel("100%")
+        self.zoom_label = QLabel("50%")
         self.zoom_label.setMinimumWidth(50)
         zoom_layout.addWidget(self.zoom_label)
         control_layout.addLayout(zoom_layout)
+        self._zoom_last_scale = self.slider_value_to_scale(self.zoom_slider.value())
         
         # View buttons
         view_layout = QHBoxLayout()
@@ -566,8 +731,17 @@ class ProjectionComparisonWindow(QMainWindow):
         
         # Update 2D image labels
         self.update_image_label(self.rgb_label, rgb_path)
-        self.update_image_label(self.gt_label, gt_path)
-        self.update_image_label(self.pred_label, pred_path)
+        self.update_image_label(
+            self.gt_label,
+            gt_path,
+            colormap_name=self.gt_colormap_name
+        )
+
+        self.update_image_label(
+            self.pred_label,
+            pred_path,
+            colormap_name=self.pred_colormap_name
+        )
         
         # Update 3D view
         if PYVISTA_AVAILABLE:
@@ -576,21 +750,150 @@ class ProjectionComparisonWindow(QMainWindow):
         
         # Update window title
         self.setWindowTitle(f"3D Comparison - {sample_name} ({self.current_index + 1}/{len(self.sample_files)})")
+        self.refresh_depth_previews()
     
-    def update_image_label(self, label: QLabel, image_path: Path):
-        """Update QLabel with image from path."""
+    def refresh_depth_previews(self):
+        """Refresh GT/Pred depth previews using current colormaps."""
+        if not self.sample_files:
+            return
+
+        sample_file = self.sample_files[self.current_index]
+        sample_name = sample_file.stem
+        gt_path = self.gt_dir / f"{sample_name}.png"
+        pred_path = self.pred_dir / f"{sample_name}.png"
+
+        gt_override = self.last_gt_depth if self.last_gt_depth is not None else None
+        if gt_override is not None:
+            gt_override = np.array(gt_override, copy=False)
+
+        show_error_control = getattr(self, "show_error_checkbox", None)
+        error_active = (
+            show_error_control is not None
+            and show_error_control.isChecked()
+            and self.last_error_map is not None
+        )
+        if error_active:
+            pred_override = self.last_error_map
+        elif self.last_pred_depth is not None:
+            pred_override = self.last_pred_depth
+        else:
+            pred_override = None
+
+        if pred_override is not None:
+            pred_override = np.array(pred_override, copy=False)
+
+        self.update_image_label(
+            self.gt_label,
+            gt_path,
+            colormap_name=self.gt_colormap_name,
+            data_override=gt_override
+        )
+        pred_cmap_name = self.error_colormap_name if error_active else self.pred_colormap_name
+        pred_value_range = (0.0, ERROR_PERCENT_MAX) if error_active else None
+
+        self.update_image_label(
+            self.pred_label,
+            pred_path,
+            colormap_name=pred_cmap_name,
+            data_override=pred_override,
+            value_range=pred_value_range
+        )
+
+    def update_image_label(
+        self,
+        label: QLabel,
+        image_path: Path,
+        colormap_name: Optional[str] = None,
+        data_override: Optional[np.ndarray] = None,
+        value_range: Optional[Tuple[float, float]] = None
+    ):
+        """Update QLabel with image, depth, or custom data visualization."""
+
+        if data_override is not None and matplotlib is not None and colormap_name is not None:
+            pixmap = self.depth_to_colormap_pixmap(data_override, colormap_name, value_range=value_range)
+            if pixmap is not None:
+                label.setPixmap(pixmap)
+                label.setText("")
+                return
+
         if not image_path.exists():
             label.setText(f"Not found:\n{image_path.name}")
             label.setStyleSheet(label.styleSheet() + " color: red;")
             return
-        
+
+        if colormap_name is not None and matplotlib is not None and data_override is None:
+            depth_img = cv2.imread(str(image_path), cv2.IMREAD_UNCHANGED)
+            if depth_img is not None:
+                pixmap = None
+                if depth_img.dtype == np.uint16:
+                    depth_m = depth_img.astype(np.float32) / 256.0
+                    pixmap = self.depth_to_colormap_pixmap(depth_m, colormap_name, value_range=value_range)
+                elif depth_img.dtype == np.float32:
+                    pixmap = self.depth_to_colormap_pixmap(depth_img, colormap_name, value_range=value_range)
+
+                if pixmap is not None:
+                    label.setPixmap(pixmap)
+                    label.setText("")
+                    return
+
         try:
             pixmap = QPixmap(str(image_path))
             label.setPixmap(pixmap)
+            label.setText("")
         except Exception as e:
             label.setText(f"Error loading:\n{image_path.name}\n{str(e)}")
             label.setStyleSheet(label.styleSheet() + " color: red;")
     
+    def depth_to_colormap_pixmap(
+        self,
+        depth_map: np.ndarray,
+        colormap_name: str,
+        value_range: Optional[Tuple[float, float]] = None
+    ) -> Optional[QPixmap]:
+        """Convert a depth map to a QPixmap using the specified colormap."""
+        if matplotlib is None:
+            return None
+
+        if value_range is not None:
+            vmin, vmax = value_range
+            mask = np.isfinite(depth_map)
+            if vmin is not None:
+                mask &= depth_map >= vmin
+        else:
+            mask = np.isfinite(depth_map) & (depth_map > 0)
+        if not np.any(mask):
+            return None
+
+        valid = depth_map[mask]
+        if value_range is not None:
+            vmin, vmax = value_range
+        else:
+            vmin = np.percentile(valid, 2.0) if valid.size > 1 else float(valid.min())
+            vmax = np.percentile(valid, 98.0) if valid.size > 1 else float(valid.max())
+            if vmax <= vmin:
+                vmax = vmin + 1e-6
+
+        denom = (vmax - vmin) if (vmax is not None and vmin is not None) else None
+        if denom is None or abs(denom) < 1e-12:
+            denom = 1e-12
+
+        norm = np.clip((depth_map - vmin) / (denom), 0.0, 1.0)
+        norm[~mask] = 0.0
+
+        try:
+            cmap = get_colormap(colormap_name)
+        except Exception:
+            cmap = get_colormap('viridis')
+
+        rgba = cmap(norm, bytes=True)
+        rgba = np.ascontiguousarray(rgba)
+        # Give non-valid pixels a dim appearance
+        rgba[~mask] = np.array([70, 70, 70, 255], dtype=np.uint8)
+
+        height, width, _ = rgba.shape
+        qimage = QImage(rgba.data, width, height, rgba.strides[0], QImage.Format_RGBA8888)
+        return QPixmap.fromImage(qimage.copy())
+
     def update_3d_view(self, gt_path: Path, pred_path: Path):
         """Update 3D viewer with GT and Pred depth maps as 3D point clouds in World coordinates."""
         camera_state = None
@@ -602,243 +905,341 @@ class ProjectionComparisonWindow(QMainWindow):
         self.plotter.clear()
         self.gt_actor = None
         self.pred_actor = None
-        
+        self.last_gt_depth = None
+        self.last_pred_depth = None
+        self.last_error_map = None
+
         # Load depth maps as 16-bit PNG
         gt_depth = None
         pred_depth = None
-        
+
         if gt_path.exists():
-            # Load as 16-bit grayscale using cv2
             gt_img = cv2.imread(str(gt_path), cv2.IMREAD_UNCHANGED)
             if gt_img is not None:
                 if gt_img.dtype == np.uint16:
-                    gt_depth = gt_img.astype(np.float32) / 256.0  # Convert to meters
+                    gt_depth = gt_img.astype(np.float32) / 256.0
                 else:
                     print(f"Warning: GT image is not 16-bit: {gt_img.dtype}")
                     gt_depth = gt_img.astype(np.float32) / 256.0
-        
+
         if pred_path.exists():
             pred_img = cv2.imread(str(pred_path), cv2.IMREAD_UNCHANGED)
             if pred_img is not None:
                 if pred_img.dtype == np.uint16:
-                    pred_depth = pred_img.astype(np.float32) / 256.0  # Convert to meters
+                    pred_depth = pred_img.astype(np.float32) / 256.0
                 else:
                     print(f"Warning: Pred image is not 16-bit: {pred_img.dtype}")
                     pred_depth = pred_img.astype(np.float32) / 256.0
-        
+
         if gt_depth is None and pred_depth is None:
-            self.plotter.add_text("No depth maps available", position='center', font_size=12, color='red', font='courier')
+            self.plotter.add_text(
+                "No depth maps available",
+                position='center',
+                font_size=12,
+                color='red',
+                font='courier'
+            )
             return
+
+        if gt_depth is not None:
+            self.last_gt_depth = gt_depth.copy()
+        if pred_depth is not None:
+            self.last_pred_depth = pred_depth.copy()
+
+        error_mode = (
+            self.show_error_checkbox.isChecked()
+            and gt_depth is not None
+            and pred_depth is not None
+        )
+
+        # Disable automatic rendering during scene construction
+        self.plotter.render_window.SetDesiredUpdateRate(0.0001)
         
-        # Get calibration parameters
-        intrinsic = DEFAULT_CALIB["a6"]["intrinsic"]
+        try:
 
-        # Camera → World transformation
-        # Step 1: Camera → LiDAR using the inverse of DEFAULT_LIDAR_TO_CAM
-        T_lidar_to_cam = DEFAULT_LIDAR_TO_CAM
-        T_cam_to_lidar = np.linalg.inv(T_lidar_to_cam)
+            intrinsic = DEFAULT_CALIB["a6"]["intrinsic"]
 
-        # Step 2: LiDAR → World using the provided calibration matrix
-        T_lidar_to_world = DEFAULT_LIDAR_TO_WORLD_v1
+            T_lidar_to_cam = DEFAULT_LIDAR_TO_CAM
+            T_cam_to_lidar = np.linalg.inv(T_lidar_to_cam)
 
-        # Combined Camera → World transformation
-        T_cam_to_world = T_lidar_to_world @ T_cam_to_lidar
-        cam_position_world = T_cam_to_world[:3, 3]
-        lidar_origin_world = T_lidar_to_world[:3, 3]
+            T_lidar_to_world = DEFAULT_LIDAR_TO_WORLD_v1
 
-        # Create point clouds using VADAS model
-        gt_points_world = None
-        pred_points_world = None
-        gt_valid_mask = None
-        pred_mask_mode = "All"
-        gt_distances = None
-        pred_distances = None
+            T_cam_to_world = T_lidar_to_world @ T_cam_to_lidar
+            cam_position_world = T_cam_to_world[:3, 3]
+            lidar_origin_world = T_lidar_to_world[:3, 3]
 
-        if gt_depth is not None and self.show_gt_checkbox.isChecked():
-            # Convert depth map to 3D points using VADAS model
-            gt_image_size = (gt_depth.shape[1], gt_depth.shape[0])
-            gt_points_cam, gt_valid_mask = depth_map_to_point_cloud_vadas(
-                gt_depth,
-                intrinsic,
-                gt_image_size,
-                return_valid_mask=True
+            gt_points_cam = None
+            gt_points_world = None
+            pred_points_world = None
+            gt_valid_mask = None
+            pred_valid_mask = None
+            pred_mask_mode = "All"
+            gt_distances = None
+            pred_distances = None
+            pred_error_values = None
+
+            gt_mask_needed = (
+                gt_depth is not None
+                and self.match_pred_to_gt_checkbox.isChecked()
+                and pred_depth is not None
+            )
+            compute_gt_cloud = gt_depth is not None and (
+                self.show_gt_checkbox.isChecked() or gt_mask_needed
             )
 
-            if len(gt_points_cam) > 0:
-                # Transform to world coordinates
+            if compute_gt_cloud:
+                gt_image_size = (gt_depth.shape[1], gt_depth.shape[0])
+                gt_points_cam, gt_valid_mask = depth_map_to_point_cloud_vadas(
+                    gt_depth,
+                    intrinsic,
+                    gt_image_size,
+                    return_valid_mask=True
+                )
+
+            if (
+                self.show_gt_checkbox.isChecked()
+                and gt_points_cam is not None
+                and len(gt_points_cam) > 0
+            ):
                 gt_points_world = transform_points_to_world(gt_points_cam, T_cam_to_world)
 
-                # Distances from LiDAR origin for non-negative scalars
                 gt_offset_from_lidar = gt_points_world - lidar_origin_world[np.newaxis, :]
                 gt_distances = np.linalg.norm(gt_offset_from_lidar, axis=1)
                 if np.any(~np.isfinite(gt_distances)):
                     gt_distances = np.nan_to_num(gt_distances, nan=0.0, posinf=0.0, neginf=0.0)
 
-                # Create PyVista point cloud
                 gt_cloud = pv.PolyData(gt_points_world)
 
-                # Use Euclidean distance for coloring
                 gt_colors = gt_distances
 
                 self.gt_actor = self.plotter.add_points(
                     gt_cloud,
                     scalars=gt_colors,
-                    point_size=2,
-                    cmap='Greens',
+                    point_size=4,
+                    cmap=self.gt_colormap_name,
+                    nan_color='black',
                     opacity=self.gt_opacity_slider.value() / 100.0,
-                    render_points_as_spheres=False,
+                    render_points_as_spheres=True,
                     name="GT_points"
                 )
 
-        if pred_depth is not None and self.show_pred_checkbox.isChecked():
-            # Convert depth map to 3D points using VADAS model
-            pred_image_size = (pred_depth.shape[1], pred_depth.shape[0])
-            allowed_mask = None
-            if (
-                self.match_pred_to_gt_checkbox.isChecked()
-                and gt_valid_mask is not None
-                and gt_valid_mask.shape == pred_depth.shape
-            ):
-                allowed_mask = gt_valid_mask
-                pred_mask_mode = "GT mask"
-            elif self.match_pred_to_gt_checkbox.isChecked() and gt_valid_mask is None:
-                pred_mask_mode = "All (no GT)"
-            elif self.match_pred_to_gt_checkbox.isChecked() and gt_valid_mask is not None:
-                print("Warning: GT and Pred depth sizes differ; falling back to full Pred points")
+            if pred_depth is not None and self.show_pred_checkbox.isChecked():
+                pred_image_size = (pred_depth.shape[1], pred_depth.shape[0])
+                allowed_mask = None
+                if (
+                    self.match_pred_to_gt_checkbox.isChecked()
+                    and gt_valid_mask is not None
+                    and gt_valid_mask.shape == pred_depth.shape
+                ):
+                    allowed_mask = gt_valid_mask
+                    pred_mask_mode = "GT mask"
+                elif self.match_pred_to_gt_checkbox.isChecked() and gt_valid_mask is None:
+                    pred_mask_mode = "All (no GT)"
+                elif self.match_pred_to_gt_checkbox.isChecked() and gt_valid_mask is not None:
+                    print("Warning: GT and Pred depth sizes differ; falling back to full Pred points")
 
-            pred_points_cam = depth_map_to_point_cloud_vadas(
-                pred_depth,
-                intrinsic,
-                pred_image_size,
-                allowed_mask=allowed_mask
-            )
+                if error_mode:
+                    pred_points_cam, pred_valid_mask = depth_map_to_point_cloud_vadas(
+                        pred_depth,
+                        intrinsic,
+                        pred_image_size,
+                        allowed_mask=allowed_mask,
+                        return_valid_mask=True
+                    )
+                else:
+                    pred_points_cam = depth_map_to_point_cloud_vadas(
+                        pred_depth,
+                        intrinsic,
+                        pred_image_size,
+                        allowed_mask=allowed_mask
+                    )
 
-            if len(pred_points_cam) > 0:
-                # Transform to world coordinates
-                pred_points_world = transform_points_to_world(pred_points_cam, T_cam_to_world)
+                if len(pred_points_cam) > 0:
+                    pred_points_world = transform_points_to_world(pred_points_cam, T_cam_to_world)
 
-                # Distances from LiDAR origin for non-negative scalars
-                pred_offset_from_lidar = pred_points_world - lidar_origin_world[np.newaxis, :]
-                pred_distances = np.linalg.norm(pred_offset_from_lidar, axis=1)
-                if np.any(~np.isfinite(pred_distances)):
-                    pred_distances = np.nan_to_num(pred_distances, nan=0.0, posinf=0.0, neginf=0.0)
+                    pred_offset_from_lidar = pred_points_world - lidar_origin_world[np.newaxis, :]
+                    pred_distances = np.linalg.norm(pred_offset_from_lidar, axis=1)
+                    if np.any(~np.isfinite(pred_distances)):
+                        pred_distances = np.nan_to_num(pred_distances, nan=0.0, posinf=0.0, neginf=0.0)
 
-                # Create PyVista point cloud
-                pred_cloud = pv.PolyData(pred_points_world)
+                    pred_cloud = pv.PolyData(pred_points_world)
 
-                # Use Euclidean distance for coloring
-                pred_colors = pred_distances
+                    pred_colors = pred_distances
 
-                self.pred_actor = self.plotter.add_points(
-                    pred_cloud,
-                    scalars=pred_colors,
-                    point_size=2,
-                    cmap='Reds',
-                    opacity=self.pred_opacity_slider.value() / 100.0,
-                    render_points_as_spheres=False,
-                    name="Pred_points"
+                    if error_mode and pred_valid_mask is not None:
+                        error_map = np.full_like(pred_depth, np.nan, dtype=np.float32)
+                        combined_mask = pred_valid_mask.copy()
+                        combined_mask &= np.isfinite(pred_depth)
+                        combined_mask &= np.isfinite(gt_depth)
+                        if (
+                            self.match_pred_to_gt_checkbox.isChecked()
+                            and gt_valid_mask is not None
+                            and gt_valid_mask.shape == combined_mask.shape
+                        ):
+                            combined_mask &= gt_valid_mask
+
+                        combined_mask &= gt_depth > 0
+                        valid_indices = np.flatnonzero(combined_mask)
+                        if valid_indices.size > 0:
+                            percent_error = np.zeros_like(pred_depth, dtype=np.float32)
+                            percent_error[combined_mask] = (
+                                np.abs(pred_depth[combined_mask] - gt_depth[combined_mask])
+                                / gt_depth[combined_mask]
+                            ) * 100.0
+                            percent_error = np.clip(percent_error, 0.0, ERROR_PERCENT_MAX)
+                            error_map[combined_mask] = percent_error[combined_mask]
+                            pred_error_values = error_map[pred_valid_mask]
+                            self.last_error_map = error_map
+
+                            finite_error = pred_error_values[np.isfinite(pred_error_values)]
+                            if finite_error.size > 0:
+                                pred_colors = pred_error_values
+                            else:
+                                pred_error_values = None
+                                self.last_error_map = None
+                        else:
+                            pred_error_values = None
+                            self.last_error_map = None
+
+                    cmap_name = self.error_colormap_name if error_mode else self.pred_colormap_name
+                    add_kwargs = {}
+                    if error_mode:
+                        add_kwargs["clim"] = [0.0, ERROR_PERCENT_MAX]
+
+                    self.pred_actor = self.plotter.add_points(
+                        pred_cloud,
+                        scalars=pred_colors,
+                        point_size=4,
+                        cmap=cmap_name,
+                        nan_color='black',
+                        opacity=self.pred_opacity_slider.value() / 100.0,
+                        render_points_as_spheres=True,
+                        name="Pred_points",
+                        **add_kwargs
+                    )
+
+            cam_origin = pv.Sphere(radius=0.03, center=cam_position_world)
+            self.plotter.add_mesh(cam_origin, color='cyan', label='Camera')
+
+            if self.show_axes_checkbox.isChecked():
+                self.plotter.add_axes(
+                    xlabel='X',
+                    ylabel='Y',
+                    zlabel='Z',
+                    line_width=2,
+                    color='white',
+                    x_color='red',
+                    y_color='green',
+                    z_color='blue',
+                    labels_off=False,
+                    interactive=False,
+                    viewport=(0, 0.85, 0.15, 1.0)
                 )
 
-    # Add LiDAR origin in world frame
-        lidar_origin = pv.Sphere(radius=0.05, center=lidar_origin_world)
-        self.plotter.add_mesh(lidar_origin, color='yellow', label='LiDAR Origin')
-
-    # Add camera position in world frame
-        cam_origin = pv.Sphere(radius=0.03, center=cam_position_world)
-        self.plotter.add_mesh(cam_origin, color='cyan', label='Camera')
-
-        # Add coordinate axes (viewport widget)
-        if self.show_axes_checkbox.isChecked():
-            axes_actor = self.plotter.add_axes(
-                xlabel='X',
-                ylabel='Y',
-                zlabel='Z',
-                line_width=2,
-                color='white',
-                x_color='red',
-                y_color='green',
-                z_color='blue',
-                labels_off=False,
-                interactive=False,
-                viewport=(0, 0.85, 0.15, 1.0)  # Upper left corner
+            info_lines = ["World Coordinates"]
+            info_lines.append(
+                f"Camera at: [{cam_position_world[0]:.2f}, {cam_position_world[1]:.2f}, {cam_position_world[2]:.2f}]"
+            )
+            info_lines.append(
+                f"LiDAR at: [{lidar_origin_world[0]:.2f}, {lidar_origin_world[1]:.2f}, {lidar_origin_world[2]:.2f}]"
             )
 
-        # Add text labels
-        info_lines = ["World Coordinates"]
-        info_lines.append(f"Camera at: [{cam_position_world[0]:.2f}, {cam_position_world[1]:.2f}, {cam_position_world[2]:.2f}]")
-        info_lines.append(f"LiDAR at: [{lidar_origin_world[0]:.2f}, {lidar_origin_world[1]:.2f}, {lidar_origin_world[2]:.2f}]")
+            if gt_points_world is not None:
+                info_lines.append(f"GT points: {len(gt_points_world)}")
+                if gt_distances is not None and len(gt_distances) > 0:
+                    finite_gt = gt_distances[np.isfinite(gt_distances)]
+                    if finite_gt.size > 0:
+                        info_lines.append(
+                            f"GT dist: {finite_gt.min():.2f}–{finite_gt.max():.2f} m (avg {finite_gt.mean():.2f} m)"
+                        )
 
-        if gt_points_world is not None:
-            info_lines.append(f"GT points: {len(gt_points_world)}")
-            if gt_distances is not None and len(gt_distances) > 0:
-                finite_gt = gt_distances[np.isfinite(gt_distances)]
-                if finite_gt.size > 0:
-                    info_lines.append(
-                        f"GT dist: {finite_gt.min():.2f}–{finite_gt.max():.2f} m (avg {finite_gt.mean():.2f} m)"
+            if pred_points_world is not None:
+                info_lines.append(f"Pred points: {len(pred_points_world)} ({pred_mask_mode})")
+                if pred_distances is not None and len(pred_distances) > 0:
+                    finite_pred = pred_distances[np.isfinite(pred_distances)]
+                    if finite_pred.size > 0:
+                        info_lines.append(
+                            f"Pred dist: {finite_pred.min():.2f}–{finite_pred.max():.2f} m (avg {finite_pred.mean():.2f} m)"
+                        )
+                if (
+                    pred_mask_mode == "GT mask"
+                    and gt_distances is not None
+                    and pred_distances is not None
+                    and len(pred_distances) == len(gt_distances)
+                    and len(pred_distances) > 0
+                ):
+                    distance_delta = np.abs(pred_distances - gt_distances)
+                    finite_delta = distance_delta[np.isfinite(distance_delta)]
+                    if finite_delta.size > 0:
+                        info_lines.append(
+                            f"Δdist avg: {finite_delta.mean():.3f} m (max {finite_delta.max():.3f} m)"
+                        )
+                if error_mode and pred_error_values is not None and pred_error_values.size > 0:
+                    finite_error = pred_error_values[np.isfinite(pred_error_values)]
+                    if finite_error.size > 0:
+                        info_lines.append(
+                            f"Error: {finite_error.min():.1f}–{finite_error.max():.1f}% (avg {finite_error.mean():.1f}%)"
+                        )
+            elif pred_depth is not None and self.show_pred_checkbox.isChecked():
+                info_lines.append(f"Pred points: 0 ({pred_mask_mode})")
+
+            if error_mode:
+                info_lines.append("Error shown as % of GT depth")
+
+            info_text = '\n'.join(info_lines)
+            self.plotter.add_text(info_text, position='lower_left', font_size=6, color='white', font='courier')
+            if self.show_gt_checkbox.isChecked():
+                gt_label = "GT"
+                if hasattr(self, 'gt_cmap_combo'):
+                    gt_label = f"GT ({self.gt_cmap_combo.currentText()})"
+                self.plotter.add_text(gt_label, position='upper_left', font_size=7, color='white', font='courier')
+            if self.show_pred_checkbox.isChecked():
+                pred_label = "Pred"
+                if self.show_error_checkbox.isChecked():
+                    pred_label = "Error (% of GT depth)"
+                elif hasattr(self, 'pred_cmap_combo'):
+                    pred_label = f"Pred ({self.pred_cmap_combo.currentText()})"
+                self.plotter.add_text(pred_label, position='upper_right', font_size=7, color='white', font='courier')
+
+            # Remove old error legend if exists
+            if hasattr(self, 'error_legend_actor') and self.error_legend_actor is not None:
+                try:
+                    self.plotter.remove_actor(self.error_legend_actor)
+                except Exception:
+                    pass
+                self.error_legend_actor = None
+            
+            # Add new error legend if in error mode
+            if error_mode and pred_error_values is not None and pred_error_values.size > 0:
+                self._add_error_legend()
+
+            if camera_state is not None:
+                try:
+                    position, focal_point, view_up = camera_state
+                    restored_state = (
+                        np.array(position, dtype=np.float64),
+                        np.array(focal_point, dtype=np.float64),
+                        np.array(view_up, dtype=np.float64)
                     )
-        if pred_points_world is not None:
-            info_lines.append(f"Pred points: {len(pred_points_world)} ({pred_mask_mode})")
-            if pred_distances is not None and len(pred_distances) > 0:
-                finite_pred = pred_distances[np.isfinite(pred_distances)]
-                if finite_pred.size > 0:
-                    info_lines.append(
-                        f"Pred dist: {finite_pred.min():.2f}–{finite_pred.max():.2f} m (avg {finite_pred.mean():.2f} m)"
-                    )
-            if (
-                pred_mask_mode == "GT mask"
-                and gt_distances is not None
-                and pred_distances is not None
-                and len(pred_distances) == len(gt_distances)
-                and len(pred_distances) > 0
-            ):
-                distance_delta = np.abs(pred_distances - gt_distances)
-                finite_delta = distance_delta[np.isfinite(distance_delta)]
-                if finite_delta.size > 0:
-                    info_lines.append(
-                        f"Δdist avg: {finite_delta.mean():.3f} m (max {finite_delta.max():.3f} m)"
-                    )
-        elif pred_depth is not None and self.show_pred_checkbox.isChecked():
-            info_lines.append(f"Pred points: 0 ({pred_mask_mode})")
+                    self.plotter.camera_position = tuple(component.tolist() for component in restored_state)
 
-        info_text = '\n'.join(info_lines)
-        self.plotter.add_text(info_text, position='lower_left', font_size=7, color='white', font='courier')
-        if self.show_gt_checkbox.isChecked():
-            self.plotter.add_text("GT (Green)", position='upper_left', font_size=8, color='green', font='courier')
-        if self.show_pred_checkbox.isChecked():
-            self.plotter.add_text("Pred (Red)", position='upper_right', font_size=8, color='red', font='courier')
-
-        # Restore camera view if requested; otherwise reset
-        if camera_state is not None:
-            try:
-                position, focal_point, view_up = camera_state
-                restored_state = (
-                    np.array(position, dtype=np.float64),
-                    np.array(focal_point, dtype=np.float64),
-                    np.array(view_up, dtype=np.float64)
-                )
-                self.plotter.camera_position = tuple(component.tolist() for component in restored_state)
-                self.plotter.render()
-
-                # Keep default camera consistent for subsequent zoom operations
-                self.default_camera = restored_state
-            except Exception as exc:
-                print(f"Warning: Failed to restore camera state ({exc}); falling back to reset.")
+                    self.default_camera = restored_state
+                    if hasattr(self, 'zoom_slider'):
+                        self._zoom_last_scale = self.slider_value_to_scale(self.zoom_slider.value())
+                except Exception as exc:
+                    print(f"Warning: Failed to restore camera state ({exc}); falling back to reset.")
+                    self.reset_camera()
+                finally:
+                    self.keep_camera_state = False
+            else:
                 self.reset_camera()
-            finally:
                 self.keep_camera_state = False
-        else:
-            self.reset_camera()
-            self.keep_camera_state = False
-    
-    def on_gt_opacity_changed(self, value: int):
-        """Handle GT opacity slider change."""
-        opacity = value / 100.0
-        self.gt_opacity_label.setText(f"{value}%")
-        
-        if PYVISTA_AVAILABLE and hasattr(self, 'plotter'):
-            if hasattr(self, 'gt_actor') and self.gt_actor is not None:
-                self.gt_actor.GetProperty().SetOpacity(opacity)
+
+        finally:
+            # Restore normal rendering rate and render ONCE at the very end
+            self.plotter.render_window.SetDesiredUpdateRate(30.0)
             self.plotter.render()
+            self.keep_camera_state = False
     
     def on_sample_changed(self, value: int):
         """Handle sample spinbox change."""
@@ -859,14 +1260,190 @@ class ProjectionComparisonWindow(QMainWindow):
     
     def on_visibility_changed(self):
         """Handle visibility checkbox changes."""
-        if PYVISTA_AVAILABLE and hasattr(self, 'plotter'):
-            # Reload the 3D view with new visibility settings
-            self.keep_camera_state = True
-            sample_file = self.sample_files[self.current_index]
-            sample_name = sample_file.stem
-            gt_path = self.gt_dir / f"{sample_name}.png"
-            pred_path = self.pred_dir / f"{sample_name}.png"
-            self.update_3d_view(gt_path, pred_path)
+        self.reload_current_view(preserve_camera=True)
+
+    def on_gt_cmap_changed(self, index: int):
+        """Apply new colormap for GT points."""
+        _ = index
+        self.gt_colormap_name = self.gt_cmap_combo.currentData()
+        self.refresh_depth_previews()
+        self.reload_current_view(preserve_camera=True)
+
+    def on_pred_cmap_changed(self, index: int):
+        """Apply new colormap for Pred points."""
+        _ = index
+        self.pred_colormap_name = self.pred_cmap_combo.currentData()
+        self.refresh_depth_previews()
+        self.reload_current_view(preserve_camera=True)
+
+    def on_show_error_changed(self, state: int):
+        _ = state
+        if self.show_error_checkbox.isChecked() and self.show_gt_checkbox.isChecked():
+            self.show_gt_checkbox.blockSignals(True)
+            self.show_gt_checkbox.setChecked(False)
+            self.show_gt_checkbox.blockSignals(False)
+        self.reload_current_view(preserve_camera=True)
+
+    def _add_error_legend(self):
+        """Add error legend with transparent background and colored squares."""
+        if not hasattr(self, "plotter"):
+            return
+        
+        # Create legend with error ranges and colors
+        legend_entries = [
+            ("0 – 0.03%", "#ffffff"),
+            ("0.03 – 1%", "#dcecff"),
+            ("1 – 5%", "#aacdff"),
+            ("5 – 20%", "#4a76d6"),
+            ("≥ 20%", "#0b2f78"),
+        ]
+        
+        try:
+            # Add legend with PyVista
+            legend_actor = self.plotter.add_legend(
+                labels=legend_entries,
+                face="rectangle",
+                size=(0.15, 0.15),
+                loc="upper right"
+            )
+            
+            if legend_actor is not None:
+                # Set transparent background
+                try:
+                    legend_actor.UseBackgroundOff()
+                except Exception:
+                    pass
+                
+                # Customize text properties
+                try:
+                    text_prop = legend_actor.GetEntryTextProperty()
+                    if text_prop is not None:
+                        text_prop.SetColor(1.0, 1.0, 1.0)  # White text
+                        text_prop.SetFontSize(8)
+                        text_prop.BoldOff()
+                except Exception:
+                    pass
+                
+                # Apply square symbols
+                self._apply_square_symbols(legend_actor, len(legend_entries))
+                
+                self.error_legend_actor = legend_actor
+                
+        except Exception as e:
+            print(f"Warning: Failed to create error legend: {e}")
+
+    def _customize_error_legend(self, legend_actor, entry_count: int) -> None:
+        if legend_actor is None or entry_count <= 0:
+            return
+
+        # Keep legend off-screen during customization
+        # Position will be set to correct location just before final render
+
+        text_property = None
+        try:
+            text_property = legend_actor.GetEntryTextProperty()
+        except AttributeError:
+            text_property = None
+
+        if text_property is not None:
+            try:
+                text_property.SetColor(*ERROR_LEGEND_TEXT_COLOR)
+            except Exception:
+                pass
+            try:
+                text_property.SetFontSize(ERROR_LEGEND_FONT_SIZE)
+            except Exception:
+                pass
+            try:
+                text_property.BoldOff()
+            except Exception:
+                pass
+
+        self._apply_square_symbols(legend_actor, entry_count)
+
+        if ERROR_LEGEND_USE_BACKGROUND:
+            try:
+                legend_actor.UseBackgroundOn()
+            except Exception:
+                pass
+            try:
+                bg_color = ERROR_LEGEND_BACKGROUND_COLOR
+                if len(bg_color) >= 3:
+                    background_property = legend_actor.GetBackgroundProperty()
+                    if background_property is not None:
+                        background_property.SetColor(*bg_color[:3])
+                        if len(bg_color) >= 4:
+                            background_property.SetOpacity(bg_color[3])
+            except Exception:
+                pass
+        else:
+            try:
+                legend_actor.UseBackgroundOff()
+            except Exception:
+                pass
+
+        try:
+            legend_actor.Modified()
+        except Exception:
+            pass
+
+    def _apply_square_symbols(self, legend_actor, entry_count: int) -> None:
+        if legend_actor is None or entry_count <= 0:
+            return
+
+        try:
+            import vtk  # type: ignore
+        except ImportError:
+            return
+
+        for idx in range(entry_count):
+            square_poly = self._create_square_symbol()
+            if square_poly is None:
+                break
+            try:
+                legend_actor.SetEntrySymbol(idx, square_poly)
+            except Exception:
+                break
+
+    @staticmethod
+    def _create_square_symbol(edge: float = 0.6):
+        try:
+            import vtk  # type: ignore
+        except ImportError:
+            return None
+
+        points = vtk.vtkPoints()
+        half = edge / 2.0
+        points.InsertNextPoint(-half, -half, 0.0)
+        points.InsertNextPoint(half, -half, 0.0)
+        points.InsertNextPoint(half, half, 0.0)
+        points.InsertNextPoint(-half, half, 0.0)
+
+        cell_array = vtk.vtkCellArray()
+        cell_array.InsertNextCell(4)
+        for i in range(4):
+            cell_array.InsertCellPoint(i)
+
+        poly_data = vtk.vtkPolyData()
+        poly_data.SetPoints(points)
+        poly_data.SetPolys(cell_array)
+        return poly_data
+
+    def reload_current_view(self, preserve_camera: bool = True):
+        if not (PYVISTA_AVAILABLE and hasattr(self, 'plotter')):
+            return
+        if not self.sample_files:
+            return
+
+        self.keep_camera_state = preserve_camera
+        sample_file = self.sample_files[self.current_index]
+        sample_name = sample_file.stem
+        gt_path = self.gt_dir / f"{sample_name}.png"
+        pred_path = self.pred_dir / f"{sample_name}.png"
+        
+        # Refresh 2D previews BEFORE 3D update to avoid extra rendering
+        self.refresh_depth_previews()
+        self.update_3d_view(gt_path, pred_path)
     
     def on_gt_opacity_changed(self, value: int):
         """Handle GT opacity slider change."""
@@ -888,37 +1465,49 @@ class ProjectionComparisonWindow(QMainWindow):
                 self.pred_actor.GetProperty().SetOpacity(opacity)
             self.plotter.render()
 
+    def slider_value_to_scale(self, value: int) -> float:
+        """Map 0-100 slider value to exponential zoom scale between 0.1× and 10×."""
+        clamped = max(0, min(100, int(value)))
+        return 10 ** ((clamped - 50) / 50.0)
+
     def on_zoom_changed(self, value: int):
         """Handle zoom slider change."""
         if not (PYVISTA_AVAILABLE and hasattr(self, 'plotter')):
             return
         if hasattr(self, 'zoom_label'):
             self.zoom_label.setText(f"{value}%")
+        new_scale = self.slider_value_to_scale(value)
+        if self._zoom_last_scale is None:
+            self._zoom_last_scale = new_scale
+            return
 
         camera_pos = self.plotter.camera_position
         if camera_pos is None:
+            self._zoom_last_scale = new_scale
             return
 
-        if self.default_camera is None:
-            self.default_camera = tuple(np.array(component, dtype=np.float64) for component in camera_pos)
-
-        if self.default_camera is None:
-            return
-
-        factor = max(value / 100.0, 0.05)
-        position, focal_point, view_up = self.default_camera
-        position = np.array(position, dtype=np.float64)
-        focal_point = np.array(focal_point, dtype=np.float64)
-        view_up = np.array(view_up, dtype=np.float64)
+        position = np.array(camera_pos[0], dtype=np.float64)
+        focal_point = np.array(camera_pos[1], dtype=np.float64)
+        view_up = np.array(camera_pos[2], dtype=np.float64)
 
         direction = position - focal_point
-        norm = np.linalg.norm(direction)
-        if norm < 1e-9:
+        distance = np.linalg.norm(direction)
+        if distance < 1e-9:
+            self._zoom_last_scale = new_scale
             return
 
-        new_position = focal_point + direction / factor
+        direction_norm = direction / distance
+        target_distance = distance * (self._zoom_last_scale / new_scale)
+        new_position = focal_point + direction_norm * target_distance
+
         self.plotter.camera_position = (new_position.tolist(), focal_point.tolist(), view_up.tolist())
         self.plotter.render()
+
+        updated_state = self.plotter.camera_position
+        if updated_state is not None:
+            self.default_camera = tuple(np.array(component, dtype=np.float64) for component in updated_state)
+
+        self._zoom_last_scale = new_scale
     
     def reset_camera(self):
         """Reset camera to default view."""
@@ -931,10 +1520,11 @@ class ProjectionComparisonWindow(QMainWindow):
                 self.default_camera = tuple(np.array(component, dtype=np.float64) for component in camera_pos)
             if hasattr(self, 'zoom_slider'):
                 self.zoom_slider.blockSignals(True)
-                self.zoom_slider.setValue(100)
+                self.zoom_slider.setValue(50)
                 self.zoom_slider.blockSignals(False)
             if hasattr(self, 'zoom_label'):
-                self.zoom_label.setText("100%")
+                self.zoom_label.setText("50%")
+            self._zoom_last_scale = self.slider_value_to_scale(self.zoom_slider.value())
     
     def top_view(self):
         """Set camera to top view."""
@@ -946,10 +1536,11 @@ class ProjectionComparisonWindow(QMainWindow):
                 self.default_camera = tuple(np.array(component, dtype=np.float64) for component in camera_pos)
             if hasattr(self, 'zoom_slider'):
                 self.zoom_slider.blockSignals(True)
-                self.zoom_slider.setValue(100)
+                self.zoom_slider.setValue(50)
                 self.zoom_slider.blockSignals(False)
             if hasattr(self, 'zoom_label'):
-                self.zoom_label.setText("100%")
+                self.zoom_label.setText("50%")
+            self._zoom_last_scale = self.slider_value_to_scale(self.zoom_slider.value())
     
     def side_view(self):
         """Set camera to side view."""
@@ -961,10 +1552,11 @@ class ProjectionComparisonWindow(QMainWindow):
                 self.default_camera = tuple(np.array(component, dtype=np.float64) for component in camera_pos)
             if hasattr(self, 'zoom_slider'):
                 self.zoom_slider.blockSignals(True)
-                self.zoom_slider.setValue(100)
+                self.zoom_slider.setValue(50)
                 self.zoom_slider.blockSignals(False)
             if hasattr(self, 'zoom_label'):
-                self.zoom_label.setText("100%")
+                self.zoom_label.setText("50%")
+            self._zoom_last_scale = self.slider_value_to_scale(self.zoom_slider.value())
     
     def take_screenshot(self):
         """Save screenshot of 3D view."""
