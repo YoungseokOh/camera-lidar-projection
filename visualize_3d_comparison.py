@@ -1011,6 +1011,9 @@ class ProjectionComparisonWindow(QMainWindow):
                 gt_cloud = pv.PolyData(gt_points_world)
 
                 gt_colors = gt_distances
+                
+                # Determine colorbar range for GT
+                gt_clim = [np.nanmin(gt_colors), np.nanmax(gt_colors)]
 
                 self.gt_actor = self.plotter.add_points(
                     gt_cloud,
@@ -1020,7 +1023,8 @@ class ProjectionComparisonWindow(QMainWindow):
                     nan_color='black',
                     opacity=self.gt_opacity_slider.value() / 100.0,
                     render_points_as_spheres=True,
-                    name="GT_points"
+                    name="GT_points",
+                    clim=gt_clim
                 )
 
             if pred_depth is not None and self.show_pred_checkbox.isChecked():
@@ -1103,8 +1107,18 @@ class ProjectionComparisonWindow(QMainWindow):
 
                     cmap_name = self.error_colormap_name if error_mode else self.pred_colormap_name
                     add_kwargs = {}
+                    
                     if error_mode:
+                        # Error mode: always use 0-20% range
                         add_kwargs["clim"] = [0.0, ERROR_PERCENT_MAX]
+                    else:
+                        # Distance mode: use GT range if both visible, otherwise use Pred's own range
+                        if self.show_gt_checkbox.isChecked() and gt_distances is not None:
+                            # Both GT and Pred visible: use GT's range as reference
+                            add_kwargs["clim"] = [np.nanmin(gt_distances), np.nanmax(gt_distances)]
+                        else:
+                            # Only Pred visible: use Pred's own range
+                            add_kwargs["clim"] = [np.nanmin(pred_colors), np.nanmax(pred_colors)]
 
                     self.pred_actor = self.plotter.add_points(
                         pred_cloud,
