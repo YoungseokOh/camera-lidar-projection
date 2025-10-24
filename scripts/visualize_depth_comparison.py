@@ -163,6 +163,9 @@ def mouse_callback(event, x, y, flags, param):
 def main(base_data_path, pcd_filename):
     global depth_map_display, original_color_mapped_depth, display_image, zoom_level, pan_x, pan_y
 
+    # 입력 경로를 절대 경로로 변환
+    base_data_path = os.path.abspath(base_data_path)
+
     # 파일 경로 구성
     depth_map_png_path = os.path.join(base_data_path, "depth_maps", pcd_filename.replace(".pcd", ".png"))
 
@@ -204,6 +207,15 @@ def main(base_data_path, pcd_filename):
     cv2.destroyAllWindows()
 
 if __name__ == "__main__":
-    base_data_directory = r"C:\Users\seok436\Documents\VSCode\Projects\Camera-LiDAR-Projection\ncdb-cls-sample\synced_data"
-    pcd_to_visualize = "0000000931.pcd" 
+    import argparse
+    
+    parser = argparse.ArgumentParser(description="Visualize depth comparison")
+    parser.add_argument("--data-dir", type=str, required=True,
+                        help="Base data directory containing synced_data folder")
+    parser.add_argument("--pcd-file", type=str, default="0000000931.pcd",
+                        help="PCD file to visualize")
+    
+    args = parser.parse_args()
+    base_data_directory = args.data_dir
+    pcd_to_visualize = args.pcd_file
     main(base_data_directory, pcd_to_visualize)

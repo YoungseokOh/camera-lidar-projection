@@ -16,9 +16,10 @@ from create_depth_maps import (
 from visualize_depth_comparison import load_depth_map_png
 from calibration_data import DEFAULT_CALIB, DEFAULT_LIDAR_TO_WORLD_v2
 
-# Define constants
-BASE_PROJECT_PATH = Path("C:/Users/seok436/Documents/VSCode/Projects/Camera-LiDAR-Projection")
-BASE_DATA_PATH = BASE_PROJECT_PATH / "ncdb-cls-sample" / "synced_data"
+# Define constants - use relative path from script location
+SCRIPT_DIR = Path(__file__).parent
+PROJECT_ROOT = SCRIPT_DIR.parent  # Go up one level from scripts/
+DEFAULT_DATA_PATH = PROJECT_ROOT / "ncdb-cls-sample" / "synced_data"
 CAM_NAME = "a6"
 
 # Custom load_image using cv2
@@ -184,7 +185,7 @@ def verify_depth_x_direction(parent_folder: Path):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Verify if LiDAR X-direction is stored as depth in generated depth maps.")
-    parser.add_argument("--parent", type=str, default=str(BASE_DATA_PATH),
+    parser.add_argument("--parent", type=str, default=str(DEFAULT_DATA_PATH),
                         help="Parent folder containing the 'synced_data' directory (e.g., 'ncdb-cls-sample/synced_data').")
     
     args = parser.parse_args()

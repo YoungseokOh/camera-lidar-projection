@@ -1,6 +1,0 @@
-Traceback (most recent call last):
-  File "c:\Users\seok436\Documents\VSCode\Projects\Camera-LiDAR-Projection\visualize_depth_comparison.py", line 260, in <module>
-    main(base_data_directory, pcd_to_visualize)
-  File "c:\Users\seok436\Documents\VSCode\Projects\Camera-LiDAR-Projection\visualize_depth_comparison.py", line 236, in main
-    color = (int(255 * normalized_depth), 0, int(255 * (1 - normalized_depth))) # BGR
-TypeError: only size-1 arrays can be converted to Python scalars

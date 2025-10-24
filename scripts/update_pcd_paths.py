@@ -42,16 +42,22 @@ def _update_path_number(path_str: Optional[str]) -> Optional[str]:
     
     return str(new_path).replace('\\', '/')
 
-def update_all_paths_in_mapping():
+def update_all_paths_in_mapping(mapping_dir: Path = None):
     """
     'mapping_data.json' 파일에서 'pcd_original_path'와 'a5_original_path'의
     숫자에서 1을 빼고 10자리로 포맷팅하여 경로를 업데이트합니다.
+    
+    Args:
+        mapping_dir: mapping_data.json 파일이 있는 디렉토리. None이면 현재 디렉토리 사용
     """
-    mapping_file = Path('mapping_data.json')
-    backup_file = Path('mapping_data.json.bak')
+    if mapping_dir is None:
+        mapping_dir = Path.cwd()
+    
+    mapping_file = mapping_dir / 'mapping_data.json'
+    backup_file = mapping_dir / 'mapping_data.json.bak'
 
     if not mapping_file.exists():
-        print(f"❌ 오류: '{mapping_file}' 파일이 현재 폴더에 없습니다.")
+        print(f"❌ 오류: '{mapping_file}' 파일이 '{mapping_dir}' 폴더에 없습니다.")
         return
 
     try:
@@ -128,4 +134,13 @@ def update_all_paths_in_mapping():
         print(f"❌ 오류: 결과 검증 중 문제가 발생했습니다. {e}")
 
 if __name__ == "__main__":
-    update_all_paths_in_mapping()
+    import argparse
+    
+    parser = argparse.ArgumentParser(description="Update PCD paths in mapping_data.json")
+    parser.add_argument("--mapping-dir", type=str, default=None,
+                        help="Directory containing mapping_data.json (default: current directory)")
+    
+    args = parser.parse_args()
+    
+    mapping_dir = Path(args.mapping_dir) if args.mapping_dir else None
+    update_all_paths_in_mapping(mapping_dir)
